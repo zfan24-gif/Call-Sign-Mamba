@@ -35,6 +35,18 @@ const SHIELD_REGEN_DELAY = 3;       // seconds after taking a hit before shields
 const RESPAWN_DELAY = 4;            // seconds dead before respawning (covers the client warp-in beat)
 const MAX_BOLTS = 400;              // hard cap on live bolts (safety)
 
+// --- Ship-to-ship hull collisions (authoritative) --------------------------------------------
+// Two live ships that overlap hull-to-hull ram each other: BOTH take symmetric collision damage
+// (shields first, then hull, via damageShip) and are shoved apart along the contact normal so they
+// don't stay lodged and re-trigger every tick. Works for ANY pair — same-team clips and cross-team
+// rams alike. A short per-pair cooldown keeps a sustained scrape from machine-gunning damage every
+// tick. This is intentionally lighter than a bolt hit so ramming is punishing but not a reliable
+// one-shot weapon.
+const SHIP_COLLIDE_RADIUS = 8;      // hull collision sphere radius (units) — snug to the fighter hull
+const SHIP_COLLIDE_DAMAGE = 22;     // damage dealt to EACH ship per collision event
+const SHIP_COLLIDE_COOLDOWN = 0.6;  // seconds before the same pair can collide-damage again
+const SHIP_COLLIDE_PUSH = 6;        // extra separation (units) added on top of un-overlapping
+
 // --- Guided missiles (heavy, homing) ----------------------------------------------------------
 const MISSILE_SPEED = 300;          // units/sec cruise speed
 const MISSILE_LIFETIME = 6.0;       // seconds before a missile self-expires
@@ -126,6 +138,16 @@ export class ArenaRoom extends Room {
       ship.squad = !!(msg && msg.squad);
     });
 
+    // Microphone AVAILABILITY presence: the client reports whether it has a working, published mic
+    // (permission granted) or not (denied / voice audio unavailable). Replicated so every client can
+    // render the correct lobby mic icon — a live mic vs. a grayed mic with a slash. Purely cosmetic
+    // presence; the audio stream itself rides the separate WebRTC/SFU layer.
+    this.onMessage('voiceMic', (client, msg) => {
+      const ship = this.state.ships.get(client.sessionId);
+      if (!ship) return;
+      ship.micState = (msg && msg.available) ? 1 : 0;
+    });
+
     // Default match config (Squadron Death Match, 10-minute round). Host may change it in the lobby.
     this.state.mode = 'sdm';
     this.state.matchState = 'lobby';
@@ -177,17 +199,33 @@ export class ArenaRoom extends Room {
       ship.missiles = maxMissiles;
     });
 
+    // READY-CHECK: any pilot toggles their own ready flag in the lobby. Replicated so every lobby
+    // shows the live ready pips. Only meaningful in the lobby; a ready flag set mid-round is harmless.
+    this.onMessage('setReady', (client, msg) => {
+      const ship = this.state.ships.get(client.sessionId);
+      if (!ship) return;
+      ship.ready = !!(msg && msg.ready);
+    });
+
     // HOST-ONLY: start the round. Flips the match live, resets the clock + team scores, and revives
-    // everyone at full health so the round begins clean. Ignored if not host or not in the lobby.
+    // everyone at full health so the round begins clean. Ignored if not host, not in the lobby, or if
+    // ANY pilot in the room has not yet armed READY (the host can't force-launch on unready pilots).
     this.onMessage('startMatch', (client) => {
       if (client.sessionId !== this.state.host) return;
       if (this.state.matchState !== 'lobby') return;
+      if (!this.allReady()) return;
       this.startMatch();
     });
 
     this._boltSeq = 0;   // monotonically increasing id source for bolt map keys
     this._missileSeq = 0; // monotonically increasing id source for missile map keys
     this._now = 0;       // accumulated sim time in seconds (for cooldowns / regen / respawn timers)
+    this._collideCd = new Map(); // "sidA|sidB" -> sim time a ram-pair may next collide-damage
+
+    // Broadcast state patches at the SAME 30Hz as the sim (Colyseus defaults to 20Hz/50ms, which
+    // makes remote ships update slower than they actually move and pads perceived latency). Matching
+    // the patch rate to TICK_HZ means every authoritative tick is replicated, tightening remote motion.
+    this.setPatchRate(TICK_MS);
 
     // Fixed-timestep authoritative loop. setSimulationInterval runs decoupled from client frame
     // rates, so every ship advances by the same FIXED_DT regardless of who's lagging.
@@ -208,6 +246,11 @@ export class ArenaRoom extends Room {
     ship.name = name;
     ship.team = team;
     ship.ship = shipId;
+    // Client-reported career progression for the ranking/honor display (see client ranks.js). We
+    // clamp the advancement score into the schema's uint32 range and coerce the Pioneer flag; these
+    // are purely cosmetic (rank insignia + honor color), so a bad value can only mis-tint a badge.
+    ship.rankScore = Math.max(0, Math.min(4294967295, Math.floor(Number(options && options.rankScore) || 0)));
+    ship.pioneer = !!(options && options.pioneer);
     // Per-hull capacities from the balance table. Kept small so no ship dominates.
     const maxHull = 100 * st.hull;
     const maxShields = 100 * st.shield;
@@ -345,11 +388,84 @@ export class ArenaRoom extends Room {
       ship.lastSeq = s.lastSeq;
     }
 
+    // --- 1b) Ship-to-ship hull collisions -----------------------------------------------------
+    this.resolveShipCollisions();
+
     // --- 2) Bolts: advance and hit-detect -----------------------------------------------------
     this.advanceBolts();
 
     // --- 3) Missiles: home toward their locked target, advance, and proximity-fuse -------------
     this.advanceMissiles();
+  }
+
+  // Authoritative ship-to-ship hull collisions. All-pairs sweep over LIVE ships (fine at 24 players):
+  // any two whose hull spheres overlap ram each other. BOTH take symmetric collision damage (through
+  // damageShip so shields absorb first and a kill is credited on destruction), and both are shoved
+  // apart along the contact normal so they separate cleanly instead of staying lodged and taking
+  // damage every tick. A per-pair cooldown throttles a sustained scrape. On a lethal ram the killer
+  // is credited to the OTHER ship. Works for same-team clips (self-inflicted, no kill credit to the
+  // other player beyond the normal killShip logic) and cross-team rams alike.
+  resolveShipCollisions() {
+    // Snapshot live ships with their sim scratch once (positions live in sim.pos, mirrored to schema).
+    const live = [];
+    for (const [sid, ship] of this.state.ships) {
+      if (!ship.alive) continue;
+      const s = this.sim.get(sid);
+      if (!s) continue;
+      live.push({ sid, ship, s });
+    }
+    const minSep = SHIP_COLLIDE_RADIUS * 2;   // centers closer than this = overlapping hulls
+    const minSep2 = minSep * minSep;
+    for (let i = 0; i < live.length; i++) {
+      const a = live[i];
+      for (let j = i + 1; j < live.length; j++) {
+        const b = live[j];
+        let dx = b.s.pos.x - a.s.pos.x;
+        let dy = b.s.pos.y - a.s.pos.y;
+        let dz = b.s.pos.z - a.s.pos.z;
+        const d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 >= minSep2) continue;   // no overlap
+
+        // Contact normal (from a -> b). Guard the degenerate exact-overlap case with a fallback axis.
+        let dist = Math.sqrt(d2);
+        if (dist < 1e-4) { dx = 1; dy = 0; dz = 0; dist = 1e-4; }
+        const nx = dx / dist, ny = dy / dist, nz = dz / dist;
+
+        // Separate the pair so they no longer overlap (split the correction evenly), plus a little
+        // extra push. Do this EVERY overlapping tick (even during cooldown) so they don't stay lodged.
+        const overlap = (minSep - dist) * 0.5 + SHIP_COLLIDE_PUSH * 0.5;
+        a.s.pos.x -= nx * overlap; a.s.pos.y -= ny * overlap; a.s.pos.z -= nz * overlap;
+        b.s.pos.x += nx * overlap; b.s.pos.y += ny * overlap; b.s.pos.z += nz * overlap;
+        // Kill the closing velocity component so they don't immediately re-overlap next tick.
+        const avn = a.s.vel.x * nx + a.s.vel.y * ny + a.s.vel.z * nz;
+        if (avn > 0) { a.s.vel.x -= nx * avn; a.s.vel.y -= ny * avn; a.s.vel.z -= nz * avn; }
+        const bvn = b.s.vel.x * nx + b.s.vel.y * ny + b.s.vel.z * nz;
+        if (bvn < 0) { b.s.vel.x -= nx * bvn; b.s.vel.y -= ny * bvn; b.s.vel.z -= nz * bvn; }
+        // Reflect the separated pose back onto the replicated schema immediately.
+        a.ship.px = a.s.pos.x; a.ship.py = a.s.pos.y; a.ship.pz = a.s.pos.z;
+        a.ship.vx = a.s.vel.x; a.ship.vy = a.s.vel.y; a.ship.vz = a.s.vel.z;
+        b.ship.px = b.s.pos.x; b.ship.py = b.s.pos.y; b.ship.pz = b.s.pos.z;
+        b.ship.vx = b.s.vel.x; b.ship.vy = b.s.vel.y; b.ship.vz = b.s.vel.z;
+
+        // Per-pair damage cooldown so a grinding scrape doesn't machine-gun damage every tick.
+        const key = a.sid < b.sid ? a.sid + '|' + b.sid : b.sid + '|' + a.sid;
+        const next = this._collideCd.get(key) || 0;
+        if (this._now < next) continue;
+        this._collideCd.set(key, this._now + SHIP_COLLIDE_COOLDOWN);
+
+        // Symmetric collision damage: each ship rams the other and is credited as the attacker on the
+        // opposing ship. damageShip handles shields-first, hit broadcast, and kill credit/death.
+        this.damageShip(a.sid, a.ship, SHIP_COLLIDE_DAMAGE, b.sid);
+        // b may have died from the ram above; only damage it if still alive so we don't double-kill.
+        if (b.ship.alive) this.damageShip(b.sid, b.ship, SHIP_COLLIDE_DAMAGE, a.sid);
+      }
+    }
+    // Prune stale cooldown entries so the map doesn't grow unbounded over a long match.
+    if (this._collideCd.size > 256) {
+      for (const [key, t] of this._collideCd) {
+        if (this._now >= t) this._collideCd.delete(key);
+      }
+    }
   }
 
   // Attempt to fire from `sessionId`: authoritative rate-limit + spawn a bolt down the nose.
@@ -650,16 +766,30 @@ export class ArenaRoom extends Room {
   // Start the configured round: reset the clock + team scores, revive everyone at full health at
   // their team anchor, and flip the match live so the tick clock begins counting down. Broadcasts a
   // 'matchStart' event so clients can drop from the lobby into flight together.
+  // True when EVERY pilot currently in the room has armed READY. An empty room is not "all ready"
+  // (there's no one to fly), so a lone/no-pilot state can't be launched. Solo/offline never reaches
+  // here (the client handles the solo-launch path directly).
+  allReady() {
+    let any = false;
+    for (const ship of this.state.ships.values()) {
+      any = true;
+      if (!ship.ready) return false;
+    }
+    return any;
+  }
+
   startMatch() {
     this.state.matchState = 'live';
     this.state.timeLeft = this.state.roundDuration;
     this.state.blueKills = 0;
     this.state.redKills = 0;
     this.state.winningTeam = -1;
-    // Clean slate: respawn every pilot and zero their per-round scoreboard.
+    // Clean slate: respawn every pilot, zero their per-round scoreboard, and clear the ready flags so
+    // a future return to the lobby runs a fresh ready-check.
     for (const [sid, ship] of this.state.ships) {
       ship.kills = 0;
       ship.deaths = 0;
+      ship.ready = false;
       const s = this.sim.get(sid);
       if (s) this.respawnShip(sid, ship, s);
     }

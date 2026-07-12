@@ -37,6 +37,23 @@ export class Ship extends Schema {
     //     WebRTC/SFU layer). These flags drive the speaking indicators + squad routing everywhere. ---
     this.speaking = false;   // true while this pilot holds push-to-talk (open mic)
     this.squad = false;      // true if this pilot has opted into SQUAD voice (talk only to same-team squad)
+    // Microphone availability, replicated so every client can render the lobby mic icon correctly:
+    //   0 = no working mic (permission denied, or voice audio unavailable) -> grayed mic w/ slash
+    //   1 = mic available (granted + published) -> live mic icon, colored when `speaking`
+    this.micState = 0;
+    // --- Ranking / honor system (client-reported career progression) ---
+    // `rankScore` is the pilot's blended lifetime advancement number (see client ranks.js:
+    // kills + weighted wins + campaign). Replicated so EVERY client renders the correct rank
+    // insignia next to this pilot's name in the lobby, live scoreboard, and match results. The
+    // authoritative per-match kills still live in `kills`; this is the persistent career total.
+    // `pioneer` flags a pre-launch "Pioneer Pilot" for the special honor color designation.
+    this.rankScore = 0;
+    this.pioneer = false;
+    // --- Lobby ready-check ---
+    // The pilot has armed READY in the lobby. The host may only start the match once EVERY pilot in
+    // the room is ready. Replicated so every lobby shows each pilot's ready pip live. Reset to false
+    // on join and after a match ends (back to the lobby), so a fresh ready-check runs each round.
+    this.ready = false;
   }
 }
 defineTypes(Ship, {
@@ -59,6 +76,10 @@ defineTypes(Ship, {
   maxMissiles: 'uint8',
   speaking: 'boolean',
   squad: 'boolean',
+  micState: 'uint8',
+  rankScore: 'uint32',
+  pioneer: 'boolean',
+  ready: 'boolean',
 });
 
 // One networked laser bolt. Spawned authoritatively when a client sends a valid 'fire' intent, then
