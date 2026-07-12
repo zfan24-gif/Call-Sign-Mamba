@@ -1,0 +1,6 @@
+- Project: 3D desktop space fighter sim; cockpit/third-person dogfights, power routing, mission waves, and deck-builder upgrade drafts.
+- Important files: `index.html` UI/HUD, `main.js` gameplay loop, `scene.js` Three.js scene/ships/projectiles, `gameState.js` missions/cards, `audio.js` playback.
+- Assets/audio: generated art in `assets/*.webp`; music/SFX in `assets/audio/*.mp3`. Audio unlocks on launch click; M toggles mute.
+- Controls: mouse aim, WASD/arrows maneuver, Space fire, Shift boost, 1/2/3 route shields/weapons/engines, V view toggle.
+- Verification: `validate_project target=three-0.184` passed. Runtime preview check timed out twice because active preview did not respond.
+- 3D notes: full-viewport renderer, custom free-flight camera, ship scale ~1-8 units, generated enemy sprites used as model-reference billboards.
