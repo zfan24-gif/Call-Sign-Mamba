@@ -361,18 +361,38 @@ export class ArenaRoom extends Room {
         continue;   // no input/movement/regen while dead
       }
 
-      // Consume the latest input this tick. We apply the freshest buffered frame (dropping older
-      // ones is fine at 30 Hz — clients also send at ~their frame rate). If none arrived, coast on
-      // the last input's held state so brief packet gaps don't stutter the ship.
-      let input = s.lastInput || IDLE_INPUT;
-      if (s.inputs.length) {
-        input = s.inputs[s.inputs.length - 1];
+      // Consume ALL inputs buffered since the last tick, integrating EACH with the exact frame dt the
+      // client used for it (stamped on the input). The client predicts at its FRAME rate (~60fps) and
+      // sends one input per frame, but the server ticks at 30 Hz — so ~2 client inputs arrive per tick.
+      // Applying only the newest one in a single FIXED_DT step diverges from the client's two smaller
+      // steps because drag, the top-speed clamp and the boundary pull are all NON-LINEAR in dt (two
+      // half-steps != one full step); that tiny per-tick residual is exactly what the client's
+      // reconciliation keeps trying to correct, producing the idle "jitter/re-center" wobble. Replaying
+      // each frame with its own dt makes the server integration match the client's prediction almost
+      // exactly, so reconciliation has nothing left to fight. lastSeq advances to the NEWEST applied
+      // input so the client acks (and stops replaying) all of them.
+      const frames = s.inputs.length;
+      if (frames) {
+        // Total integrated time is bounded so a burst of buffered frames after a hitch can't fling the
+        // ship; if the summed real dt is missing (older client, dt=0) or over budget, fall back to an
+        // even split of the fixed step across the frames.
+        let sumDt = 0;
+        for (let i = 0; i < frames; i++) sumDt += s.inputs[i].dt || 0;
+        const budget = FIXED_DT * 1.5;                    // at most 1.5 ticks of motion per tick
+        const useReal = sumDt > 1e-4 && sumDt <= budget;
+        const evenDt = FIXED_DT / frames;
+        for (let i = 0; i < frames; i++) {
+          const fd = useReal ? (s.inputs[i].dt || evenDt) : evenDt;
+          stepShip(s, s.inputs[i], fd, s.speed || 1);
+        }
+        s.lastInput = s.inputs[frames - 1];
+        s.lastSeq = s.lastInput.seq >>> 0;
         s.inputs.length = 0;
-        s.lastInput = input;
-        s.lastSeq = input.seq >>> 0;
+      } else {
+        // No new input this tick: coast on the last held input so a brief packet gap doesn't stutter.
+        stepShip(s, s.lastInput || IDLE_INPUT, FIXED_DT, s.speed || 1);
       }
-
-      stepShip(s, input, FIXED_DT, s.speed || 1);
+      const input = s.lastInput || IDLE_INPUT;
 
       // Shield regen after a grace period since the last hit (up to this hull's capacity).
       const maxSh = s.maxShields || 100;
@@ -833,6 +853,10 @@ const IDLE_INPUT = { seq: 0, steerX: 0, steerY: 0, roll: 0, thrust: false, rever
 function sanitizeInput(m) {
   return {
     seq: (m.seq >>> 0) || 0,
+    // Frame timestep the client integrated this input with. Clamp to a sane range so a bogus/huge
+    // value can't fling a ship; 0 means "unknown" (older clients) and the tick falls back to its
+    // own even sub-division of the fixed step. Cap at ~50ms (a 20fps frame) to bound catch-up.
+    dt: clampNum(m.dt, 0, 0.05),
     steerX: clampNum(m.steerX, -1.4, 1.4),
     steerY: clampNum(m.steerY, -1.4, 1.4),
     roll: clampNum(m.roll, -1, 1),
