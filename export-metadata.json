@@ -1,0 +1,17 @@
+{
+  "name": "Call Sign Mamba - Multiplayer Fork",
+  "revisionLabel": "Add confirmation dialog for leaving multiplayer lobby",
+  "description": "Remixed from Call Sign Mamba",
+  "mode": "Universal",
+  "exportDate": "2026-07-12T15:08:15.398Z",
+  "rosebudBuiltInSplash": {
+    "present": true,
+    "version": 1
+  },
+  "assetCount": 447,
+  "assetTypes": [
+    "image",
+    "audio",
+    "model"
+  ]
+}
