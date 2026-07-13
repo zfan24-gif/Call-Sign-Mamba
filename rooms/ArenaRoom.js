@@ -32,6 +32,22 @@ const FIRE_COOLDOWN = 0.14;         // min seconds between a player's shots (ser
 const HIT_RADIUS = 14;
 const SHIELD_REGEN = 9;             // shield charge/sec, regenerates when not recently hit
 const SHIELD_REGEN_DELAY = 3;       // seconds after taking a hit before shields recharge
+
+// --- Lag compensation (server-side rewind) ----------------------------------------------------
+// Fast-moving targets in a 12v12 arena are exactly where "I clearly hit that and it didn't count"
+// comes from: by the time a shooter's fire intent reaches the 30 Hz server, every enemy has already
+// moved on for one round-trip of network latency, so the server hit-tests against positions the
+// shooter never actually saw. Lag compensation fixes this WITHOUT giving up server authority: we
+// keep a short ring-buffer of every ship's recent CENTER positions, and when we hit-test a bolt we
+// rewind each candidate target to where it was at the moment the shooter fired (their view time =
+// now - their one-way latency - the client's interpolation delay). We test the swept bolt segment
+// against that REWOUND center, then apply damage authoritatively. The client is unchanged; if it
+// opts into the optional 'ping' echo we get a sharp per-player RTT, otherwise we fall back to a
+// conservative default so old clients still benefit.
+const LAGCOMP_HISTORY_SEC = 0.5;    // seconds of per-ship position history to keep (>= max rewind)
+const LAGCOMP_MAX_REWIND = 0.35;    // hard cap on how far back we'll ever rewind a target (anti-abuse)
+const LAGCOMP_INTERP_DELAY = 0.10;  // client renders remote ships this far in the past (interp buffer)
+const LAGCOMP_DEFAULT_RTT = 0.10;   // assumed round-trip when a client hasn't reported a ping (100ms)
 const RESPAWN_DELAY = 4;            // seconds dead before respawning (covers the client warp-in beat)
 const MAX_BOLTS = 400;              // hard cap on live bolts (safety)
 
@@ -114,6 +130,21 @@ export class ArenaRoom extends Room {
     // A client asks to fire. We AUTHORITATIVELY spawn the bolt from the shooter's current nose —
     // the client sends no position/direction, so it can't fake trajectories. Rate-limited server-side.
     this.onMessage('fire', (client) => this.tryFire(client.sessionId));
+
+    // SERVER-DRIVEN RTT probe for lag compensation. Rather than trust any latency number or clock the
+    // client claims, the SERVER periodically sends a 'netprobe' stamped with its OWN monotonic id +
+    // send time (see maybeSendProbes in the tick). The client's only job is to echo that id straight
+    // back in a 'netprobe' reply. When the echo returns we measure the TRUE round trip against our own
+    // clock — no client clock, no trusted client value — and fold it into a smoothed per-player RTT
+    // used to rewind targets for this shooter's bolts. Fully opt-in + backward compatible: a client
+    // that never echoes just keeps LAGCOMP_DEFAULT_RTT and still benefits from the interp-delay rewind.
+    this.onMessage('netprobe', (client, msg) => {
+      const s = this.sim.get(client.sessionId);
+      if (!s || !msg || !s._probe || (msg.id >>> 0) !== s._probe.id) return;   // ignore stale/forged ids
+      const rttSample = Math.min(1, Math.max(0, (Date.now() - s._probe.sentMs) / 1000));
+      s.rtt = s.rtt > 0 ? s.rtt * 0.8 + rttSample * 0.2 : rttSample;   // EMA so one late packet can't spike
+      s._probe = null;   // await the next scheduled probe
+    });
 
     // A client asks to launch a guided missile at a locked target. The client sends ONLY the target's
     // sessionId (the intent) — the server validates it's a live hostile, spawns the missile from the
@@ -219,6 +250,7 @@ export class ArenaRoom extends Room {
 
     this._boltSeq = 0;   // monotonically increasing id source for bolt map keys
     this._missileSeq = 0; // monotonically increasing id source for missile map keys
+    this._probeSeq = 0;  // monotonically increasing id source for RTT netprobes
     this._now = 0;       // accumulated sim time in seconds (for cooldowns / regen / respawn timers)
     this._collideCd = new Map(); // "sidA|sidB" -> sim time a ram-pair may next collide-damage
 
@@ -290,6 +322,14 @@ export class ArenaRoom extends Room {
       lastHitAt: -999,  // sim time of last damage taken (gates shield regen)
       respawnAt: 0,     // sim time to respawn at (when dead)
       killStreak: 0,    // confirmed kills THIS LIFE (drives the missile-resupply reward; reset on death)
+      // Lag-compensation scratch (server-only). `history` is a ring-buffer of recent CENTER positions
+      // {t, x, y, z} used to rewind this ship when someone shoots at it. `rtt` is the smoothed measured
+      // round-trip (0 until the first probe echo -> falls back to LAGCOMP_DEFAULT_RTT). `_probe` holds
+      // the outstanding RTT probe (id + send time) awaiting an echo.
+      history: [],
+      rtt: 0,
+      _probe: null,
+      _nextProbeAt: 0,
       // Per-hull balance (from shipStats.js): capacities + damage dealt + move scale.
       maxHull, maxShields,
       maxMissiles,
@@ -406,7 +446,20 @@ export class ArenaRoom extends Room {
       ship.qx = s.quat.x; ship.qy = s.quat.y; ship.qz = s.quat.z; ship.qw = s.quat.w;
       ship.boost = !!input.boost;
       ship.lastSeq = s.lastSeq;
+
+      // LAG COMPENSATION: record this tick's authoritative CENTER into the ring-buffer, then drop any
+      // samples older than the history window. This is the timeline we rewind through when another
+      // player shoots at this ship. (Recorded for live ships only; the buffer is cleared on respawn so
+      // a stale pre-death position can never be rewound into.)
+      s.history.push({ t: this._now, x: s.pos.x, y: s.pos.y, z: s.pos.z });
+      const cutoff = this._now - LAGCOMP_HISTORY_SEC;
+      while (s.history.length && s.history[0].t < cutoff) s.history.shift();
     }
+
+    // --- 1a) Lag-compensation RTT probes ------------------------------------------------------
+    // Fire off a fresh netprobe to any player whose previous probe has been answered (or never sent)
+    // and whose schedule is due. The echo handler (onMessage 'netprobe') measures the true round trip.
+    this.maybeSendProbes();
 
     // --- 1b) Ship-to-ship hull collisions -----------------------------------------------------
     this.resolveShipCollisions();
@@ -625,6 +678,7 @@ export class ArenaRoom extends Room {
   // Move every bolt, expire old ones, and test each against enemy-team ships (sphere check with a
   // segment sweep so fast bolts don't tunnel through a ship between ticks).
   advanceBolts() {
+    const rewound = this._rewoundScratch || (this._rewoundScratch = { x: 0, y: 0, z: 0 });
     for (const [id, bolt] of this.state.bolts) {
       // Advance and age.
       const nx = bolt.px + bolt.vx * FIXED_DT;
@@ -632,16 +686,24 @@ export class ArenaRoom extends Room {
       const nz = bolt.pz + bolt.vz * FIXED_DT;
       bolt._ttl -= FIXED_DT;
 
+      // LAG COMPENSATION: rewind candidate targets to where the SHOOTER saw them when this bolt was
+      // fired (half their RTT + interp delay). Computed once per bolt from the shooter's sim scratch.
+      const shooterSim = this.sim.get(bolt.owner);
+      const rewind = this.rewindTimeFor(shooterSim);
+
       let consumed = false;
       // Swept collision: closest approach of the segment (bolt.p -> n) to each enemy ship center.
       for (const [sid, ship] of this.state.ships) {
         if (!ship.alive) continue;
         if (sid === bolt.owner) continue;       // never hit the shooter
         if (ship.team === bolt.team) continue;  // no friendly fire
-        if (segmentHitsSphere(bolt.px, bolt.py, bolt.pz, nx, ny, nz, ship.px, ship.py, ship.pz, HIT_RADIUS)) {
+        // Test against the target's REWOUND center (its position at the shooter's view time), not its
+        // live center — this is what makes a well-aimed shot at a moving target actually connect.
+        const tsim = this.sim.get(sid);
+        this.rewoundCenter(tsim, ship, rewind, rewound);
+        if (segmentHitsSphere(bolt.px, bolt.py, bolt.pz, nx, ny, nz, rewound.x, rewound.y, rewound.z, HIT_RADIUS)) {
           // Damage scales with the SHOOTER's firepower multiplier (heavier hulls hit harder).
-          const shooter = this.sim.get(bolt.owner);
-          const dmg = BOLT_DAMAGE * (shooter && shooter.firepower ? shooter.firepower : 1);
+          const dmg = BOLT_DAMAGE * (shooterSim && shooterSim.firepower ? shooterSim.firepower : 1);
           this.damageShip(sid, ship, dmg, bolt.owner);
           consumed = true;
           break;
@@ -781,6 +843,59 @@ export class ArenaRoom extends Room {
     s.lastHitAt = this._now;
     s.inputs.length = 0;
     s.lastInput = IDLE_INPUT;
+    // Clear the lag-comp history so a shot arriving right after respawn can't rewind into this pilot's
+    // PREVIOUS life's death position (which is nowhere near the fresh spawn).
+    s.history.length = 0;
+  }
+
+  // Send an RTT netprobe to each connected player whose last probe has been answered (or was never
+  // sent) and whose ~0.5s schedule is due. Called once per tick. The reply is measured in the
+  // 'netprobe' onMessage handler; unanswered probes simply expire and are re-sent on schedule.
+  maybeSendProbes() {
+    const nowMs = Date.now();
+    for (const client of this.clients) {
+      const s = this.sim.get(client.sessionId);
+      if (!s) continue;
+      if (s._probe && (nowMs - s._probe.sentMs) < 2000) continue;   // outstanding probe still pending
+      if (this._now < s._nextProbeAt) continue;                     // not due yet
+      const id = (++this._probeSeq) >>> 0;
+      s._probe = { id, sentMs: nowMs };
+      s._nextProbeAt = this._now + 0.5;   // probe roughly twice a second
+      try { client.send('netprobe', { id }); } catch {}
+    }
+  }
+
+  // The one-way rewind time to apply when SHOOTER `s` fires at another ship: half their measured
+  // round-trip (or a conservative default until a probe has landed) plus the client's interpolation
+  // delay, since remote ships are rendered that far in the past on the shooter's screen. Clamped so a
+  // spiking/forged latency can never rewind targets absurdly far into the past.
+  rewindTimeFor(s) {
+    const rtt = (s && s.rtt > 0) ? s.rtt : LAGCOMP_DEFAULT_RTT;
+    return Math.min(LAGCOMP_MAX_REWIND, rtt * 0.5 + LAGCOMP_INTERP_DELAY);
+  }
+
+  // Resolve a target ship's CENTER as the shooter saw it `rewind` seconds ago, by interpolating the
+  // target's position history. Writes into the provided out={x,y,z} to avoid per-call allocation.
+  // Falls back to the live center when there's no usable history (e.g. just spawned).
+  rewoundCenter(targetSim, liveShip, rewind, out) {
+    const hist = targetSim && targetSim.history;
+    if (!hist || hist.length === 0) { out.x = liveShip.px; out.y = liveShip.py; out.z = liveShip.pz; return; }
+    const targetT = this._now - rewind;
+    // Newer than our oldest sample? Walk from the newest back to find the bracketing pair.
+    if (targetT >= hist[hist.length - 1].t) { const h = hist[hist.length - 1]; out.x = h.x; out.y = h.y; out.z = h.z; return; }
+    if (targetT <= hist[0].t) { const h = hist[0]; out.x = h.x; out.y = h.y; out.z = h.z; return; }
+    for (let i = hist.length - 1; i > 0; i--) {
+      const b = hist[i], a = hist[i - 1];
+      if (targetT >= a.t && targetT <= b.t) {
+        const span = b.t - a.t;
+        const f = span > 1e-6 ? (targetT - a.t) / span : 0;
+        out.x = a.x + (b.x - a.x) * f;
+        out.y = a.y + (b.y - a.y) * f;
+        out.z = a.z + (b.z - a.z) * f;
+        return;
+      }
+    }
+    const h = hist[hist.length - 1]; out.x = h.x; out.y = h.y; out.z = h.z;
   }
 
   // Start the configured round: reset the clock + team scores, revive everyone at full health at
