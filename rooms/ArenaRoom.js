@@ -401,32 +401,29 @@ export class ArenaRoom extends Room {
         continue;   // no input/movement/regen while dead
       }
 
-      // Consume ALL inputs buffered since the last tick, integrating EACH with the exact frame dt the
-      // client used for it (stamped on the input). The client predicts at its FRAME rate (~60fps) and
-      // sends one input per frame, but the server ticks at 30 Hz — so ~2 client inputs arrive per tick.
-      // Applying only the newest one in a single FIXED_DT step diverges from the client's two smaller
-      // steps because drag, the top-speed clamp and the boundary pull are all NON-LINEAR in dt (two
-      // half-steps != one full step); that tiny per-tick residual is exactly what the client's
-      // reconciliation keeps trying to correct, producing the idle "jitter/re-center" wobble. Replaying
-      // each frame with its own dt makes the server integration match the client's prediction almost
-      // exactly, so reconciliation has nothing left to fight. lastSeq advances to the NEWEST applied
-      // input so the client acks (and stops replaying) all of them.
+      // Consume the inputs buffered since the last tick, integrating EACH at the EXACT frame dt the
+      // client stamped on it. This is the heart of client/server agreement: the client predicts every
+      // frame locally at its real dt, so the server must reintegrate those same frames at those same
+      // dts. drag, the top-speed clamp and the boundary pull are all NON-LINEAR in dt (two half-steps
+      // != one full step), so ANY time-rescaling here permanently diverges from the client's prediction
+      // — the "rubber-band while moving" that reconciliation could never win.
+      //
+      // FAITHFUL REPLAY: integrate EVERY buffered frame in order at its OWN stamped dt — no rescaling,
+      // no time-compression, no dropping inside the tick. Because the client predicted each of these
+      // frames locally at exactly these dts, reintegrating them identically leaves prediction and
+      // authoritative truth in near-perfect agreement, so reconciliation has essentially nothing to
+      // correct (this is what removes the "rubber-band while moving" for good). Runaway motion is
+      // already bounded upstream: the input queue is capped at INPUT_QUEUE_CAP and DROPS THE OLDEST on
+      // overflow at arrival time (see onMessage 'input'), so a post-hitch backlog can never exceed a
+      // few frames of real dt here, and any frame that WAS dropped was discarded before it received an
+      // ack — the client keeps replaying it, so no unacked-yet-applied gap can open.
       const frames = s.inputs.length;
       if (frames) {
-        // Total integrated time is bounded so a burst of buffered frames after a hitch can't fling the
-        // ship; if the summed real dt is missing (older client, dt=0) or over budget, fall back to an
-        // even split of the fixed step across the frames.
-        let sumDt = 0;
-        for (let i = 0; i < frames; i++) sumDt += s.inputs[i].dt || 0;
-        const budget = FIXED_DT * 1.5;                    // at most 1.5 ticks of motion per tick
-        const useReal = sumDt > 1e-4 && sumDt <= budget;
-        const evenDt = FIXED_DT / frames;
         for (let i = 0; i < frames; i++) {
-          const fd = useReal ? (s.inputs[i].dt || evenDt) : evenDt;
-          stepShip(s, s.inputs[i], fd, s.speed || 1);
+          stepShip(s, s.inputs[i], s.inputs[i].dt || FIXED_DT, s.speed || 1);
         }
         s.lastInput = s.inputs[frames - 1];
-        s.lastSeq = s.lastInput.seq >>> 0;
+        s.lastSeq = s.lastInput.seq >>> 0;   // ack the newest applied input so the client stops replaying them
         s.inputs.length = 0;
       } else {
         // No new input this tick: coast on the last held input so a brief packet gap doesn't stutter.
