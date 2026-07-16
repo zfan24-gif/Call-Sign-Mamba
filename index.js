@@ -122,7 +122,15 @@ const gameServer = new Server({
 // Register the 12v12 arena. Clients join it by name 'arena'. Colyseus matchmaking will place
 // players into an existing arena that still has room, or spin up a new one when it's full — so a
 // single logical "lobby" scales to multiple 24-player matches automatically.
-gameServer.define('arena', ArenaRoom);
+//
+// sortBy clients DESC = PACK joiners into the MOST-populated non-full room first. Without this,
+// two pilots calling joinOrCreate at nearly the same time can each spin up their OWN empty arena
+// (a matchmaking race), and since each is then the FIRST pilot in their room they BOTH get team 0
+// (blue) and never see each other's real team — the "both players on team 0 / see each other's
+// mic light / orientation looks 90° off (no shared reference frame)" bug. Packing toward the
+// fullest open room makes a small party reliably land in ONE arena, where the balanced-team
+// assignment (blue for the 1st, red for the 2nd, ...) works as intended.
+gameServer.define('arena', ArenaRoom).sortBy({ clients: -1 });
 
 gameServer.listen(PORT, HOST);
 // Log both a local-friendly URL and the bind target so deploy logs clearly show it came up. Over a
