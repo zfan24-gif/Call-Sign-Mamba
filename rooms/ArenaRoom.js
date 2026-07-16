@@ -265,8 +265,18 @@ export class ArenaRoom extends Room {
   }
 
   // Assign the incoming player to the smaller team (keeps 12v12 balanced as people join/leave).
+  // Count LIVE membership straight from the ships map rather than trusting the running
+  // blueCount/redCount counters. Those counters can drift (a missed decrement on an ungraceful
+  // disconnect, a reconnect, or a room reuse) and a drifted counter made pickTeam() send BOTH
+  // pilots to blue — the "both clients read myTeam=0, enemy spawns broadside" bug. Deriving the
+  // split from actual ships is self-healing: it is always correct regardless of counter state.
   pickTeam() {
-    return this.state.blueCount <= this.state.redCount ? 0 : 1;
+    let blue = 0, red = 0;
+    this.state.ships.forEach((s) => { if (s.team === 0) blue++; else red++; });
+    // Keep the replicated counters honest as a side effect so lobby/HUD readouts match reality.
+    this.state.blueCount = blue;
+    this.state.redCount = red;
+    return blue <= red ? 0 : 1;
   }
 
   onJoin(client, options) {
