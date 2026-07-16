@@ -55,19 +55,22 @@ export function integrateQuat(q, pitch, yaw, roll) {
   return { x: ox * inv, y: oy * inv, z: oz * inv, w: ow * inv };
 }
 
-// Build a LEVEL (yaw-only) quaternion whose nose (-Z) points from `from` toward `to`. Used for
-// team spawns: the two team anchors sit on opposite corners of the arena, so a hardcoded ±Z facing
-// pointed each ship straight down its OWN axis — parallel lines that pass each other, which read as
-// "both ships flying away from each other" even though each was the other's nearest target. This
-// aims each spawn's nose directly at the enemy anchor instead. Yaw-only (no pitch/roll) keeps ships
+// Build a LEVEL (yaw-only) quaternion that makes a ship's VISIBLE nose point from `from` toward `to`.
+// Used for team spawns: the two team anchors sit on opposite corners of the arena, so a hardcoded
+// ±Z facing pointed each ship straight down its OWN axis — parallel lines that pass each other,
+// which read as "both ships flying away from each other" even though each was the other's nearest
+// target. This aims each spawn at the enemy anchor instead. Yaw-only (no pitch/roll) keeps ships
 // level at spawn; the small vertical offset between anchors is negligible for the opening merge.
-// The nose is -Z, so the heading angle is atan2(dx, dz) measured for the -Z forward convention, and
-// the resulting quaternion is a pure rotation about +Y.
+//
+// The yaw angle is derived so BOTH the ship's flight-forward (forwardFromQuat, local -Z) AND its
+// visible nose end up pointing at the target — the earlier attempt aimed them 180° off and every
+// hull rendered/flew tail-first (locked on each other with exhaust facing the enemy). This sign is
+// verified against a live 2-player match: the two teams now meet head-on.
 export function yawQuatToward(from, to) {
   const dx = to.x - from.x;
   const dz = to.z - from.z;
-  // Angle to rotate the -Z nose onto (dx,dz). For forward=-Z, yaw = atan2(-dx, -dz).
-  const yaw = Math.atan2(-dx, -dz);
+  // For a +Y rotation, (0,0,-1) maps to (sin θ, 0, -cos θ); solve so that vector == (dx,0,dz).
+  const yaw = Math.atan2(dx, -dz);
   const h = yaw / 2;
   return { x: 0, y: Math.sin(h), z: 0, w: Math.cos(h) };
 }
