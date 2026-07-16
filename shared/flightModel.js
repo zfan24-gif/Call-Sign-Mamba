@@ -55,6 +55,23 @@ export function integrateQuat(q, pitch, yaw, roll) {
   return { x: ox * inv, y: oy * inv, z: oz * inv, w: ow * inv };
 }
 
+// Build a LEVEL (yaw-only) quaternion whose nose (-Z) points from `from` toward `to`. Used for
+// team spawns: the two team anchors sit on opposite corners of the arena, so a hardcoded ±Z facing
+// pointed each ship straight down its OWN axis — parallel lines that pass each other, which read as
+// "both ships flying away from each other" even though each was the other's nearest target. This
+// aims each spawn's nose directly at the enemy anchor instead. Yaw-only (no pitch/roll) keeps ships
+// level at spawn; the small vertical offset between anchors is negligible for the opening merge.
+// The nose is -Z, so the heading angle is atan2(dx, dz) measured for the -Z forward convention, and
+// the resulting quaternion is a pure rotation about +Y.
+export function yawQuatToward(from, to) {
+  const dx = to.x - from.x;
+  const dz = to.z - from.z;
+  // Angle to rotate the -Z nose onto (dx,dz). For forward=-Z, yaw = atan2(-dx, -dz).
+  const yaw = Math.atan2(-dx, -dz);
+  const h = yaw / 2;
+  return { x: 0, y: Math.sin(h), z: 0, w: Math.cos(h) };
+}
+
 // Rotate the unit vector (0,0,-1) — the ship's nose — by quaternion q. Returns {x,y,z}.
 export function forwardFromQuat(q) {
   // v = (0,0,-1). Standard q * v * q^-1 specialized for v=(0,0,-1).

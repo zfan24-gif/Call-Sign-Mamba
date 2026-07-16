@@ -10,7 +10,7 @@
 // out with TODO markers where they'll slot in.
 import { Room } from '@colyseus/core';
 import { ArenaState, Ship, Bolt, Missile } from './schema.js';
-import { stepShip, forwardFromQuat } from '../shared/flightModel.js';
+import { stepShip, forwardFromQuat, yawQuatToward } from '../shared/flightModel.js';
 import { sanitizeShip, statsFor } from './shipStats.js';
 
 const TICK_HZ = 30;                 // authoritative simulation rate
@@ -96,10 +96,20 @@ function missileTurnForRange(dist) {
 const ROUND_DURATIONS = [300, 600, 900, 1200];   // 5 / 10 / 15 / 20 minutes (seconds)
 const DEFAULT_ROUND = 600;                        // 10 minutes
 
-// Team spawn anchors: blue spawns on one side of the arena, red on the other, facing inward.
+// Team spawn anchors: blue spawns on one side of the arena, red on the other. The anchors sit on
+// OPPOSITE diagonal corners, so the old "face ±Z" scheme aimed each ship straight down its own
+// Z axis — two parallel headings 520 units apart that slide past each other, which read on screen
+// as both ships flying AWAY from each other even while each was the other's nearest target. Spawns
+// now aim their nose at the ENEMY anchor via yawQuatToward (see spawnFacing), so the opening merge
+// is a true head-on pass.
 const SPAWN = {
-  0: { pos: [-260, 0, 260],  faceZ: -1 },   // blue
-  1: { pos: [ 260, 0, -260], faceZ:  1 },    // red
+  0: { pos: [-260, 0, 260]  },   // blue
+  1: { pos: [ 260, 0, -260] },   // red
+};
+// The point each team should aim its nose at on spawn/respawn: the OTHER team's anchor.
+const ENEMY_ANCHOR = {
+  0: { x: SPAWN[1].pos[0], y: SPAWN[1].pos[1], z: SPAWN[1].pos[2] },
+  1: { x: SPAWN[0].pos[0], y: SPAWN[0].pos[1], z: SPAWN[0].pos[2] },
 };
 // Respawn scatter: after a death, a ship warps back in at a RANDOM point drawn around its team
 // anchor (not the exact spot it died) so pilots don't rematerialize in the same kill-box. We sample
@@ -107,6 +117,15 @@ const SPAWN = {
 // respawning pilot lands away from the pack that just killed them.
 const RESPAWN_SPREAD = 220;         // units around the team anchor a respawn may scatter
 const RESPAWN_CANDIDATES = 8;       // sample this many points, keep the safest (farthest from enemies)
+
+// Ghost reaper: a client that closed its tab, crashed, or dropped WiFi ungracefully doesn't always
+// trigger a prompt onLeave — Colyseus may hold the seat waiting for a clean close that never comes,
+// so the pilot lingers in the lobby/arena roster forever ("player stuck in the lobby that's no
+// longer playing"). We stamp each sim entry's lastSeen on every message and, in the tick, evict any
+// ship we haven't heard from in STALE_SHIP_TIMEOUT seconds. This self-heals ghosts no matter how the
+// client vanished. A LIVE client sends input every frame; even a lobby-idle client's UI polls the
+// server, so a healthy connection refreshes lastSeen well inside this window.
+const STALE_SHIP_TIMEOUT = 12;      // seconds of total silence before a ship is treated as a ghost and removed
 
 export class ArenaRoom extends Room {
   onCreate(options) {
@@ -122,6 +141,7 @@ export class ArenaRoom extends Room {
     this.onMessage('input', (client, msg) => {
       const s = this.sim.get(client.sessionId);
       if (!s || !msg) return;
+      s.lastSeen = this._now;   // proof of life for the ghost reaper
       // Guard against floods: keep only the most recent inputs.
       if (s.inputs.length >= INPUT_QUEUE_CAP) s.inputs.shift();
       s.inputs.push(sanitizeInput(msg));
@@ -140,7 +160,9 @@ export class ArenaRoom extends Room {
     // that never echoes just keeps LAGCOMP_DEFAULT_RTT and still benefits from the interp-delay rewind.
     this.onMessage('netprobe', (client, msg) => {
       const s = this.sim.get(client.sessionId);
-      if (!s || !msg || !s._probe || (msg.id >>> 0) !== s._probe.id) return;   // ignore stale/forged ids
+      if (!s || !msg) return;
+      s.lastSeen = this._now;   // any probe echo is proof of life for the ghost reaper (before the id guard)
+      if (!s._probe || (msg.id >>> 0) !== s._probe.id) return;   // ignore stale/forged ids for the RTT math
       const rttSample = Math.min(1, Math.max(0, (Date.now() - s._probe.sentMs) / 1000));
       s.rtt = s.rtt > 0 ? s.rtt * 0.8 + rttSample * 0.2 : rttSample;   // EMA so one late packet can't spike
       s._probe = null;   // await the next scheduled probe
@@ -306,9 +328,11 @@ export class ArenaRoom extends Room {
     // Seat the ship at its team spawn, nose pointed inward toward the fight.
     const sp = SPAWN[team];
     ship.px = sp.pos[0]; ship.py = sp.pos[1]; ship.pz = sp.pos[2];
-    // Face along ±Z: identity quat faces -Z (nose), so red (faceZ +1) needs a 180° yaw.
-    if (sp.faceZ === 1) { ship.qx = 0; ship.qy = 1; ship.qz = 0; ship.qw = 0; }
-    else { ship.qx = 0; ship.qy = 0; ship.qz = 0; ship.qw = 1; }
+    // Aim the nose directly at the ENEMY anchor so both teams spawn nose-to-nose for a head-on
+    // opening pass, instead of each pointing straight down its own Z axis (parallel headings that
+    // slide past each other and read as "flying away from each other").
+    const q = yawQuatToward({ x: sp.pos[0], y: sp.pos[1], z: sp.pos[2] }, ENEMY_ANCHOR[team]);
+    ship.qx = q.x; ship.qy = q.y; ship.qz = q.z; ship.qw = q.w;
 
     this.state.ships.set(client.sessionId, ship);
     if (team === 0) this.state.blueCount++; else this.state.redCount++;
@@ -326,6 +350,7 @@ export class ArenaRoom extends Room {
       quat: { x: ship.qx, y: ship.qy, z: ship.qz, w: ship.qw },
       inputs: [],
       lastSeq: 0,
+      lastSeen: this._now,   // last time we heard ANY message from this client (ghost-reaper watchdog)
       // Combat scratch (server-only, never replicated):
       fireCd: 0,        // seconds remaining until this player can fire again
       missileCd: 0,     // seconds remaining until this player can launch another missile
@@ -351,25 +376,32 @@ export class ArenaRoom extends Room {
   }
 
   onLeave(client) {
-    const ship = this.state.ships.get(client.sessionId);
-    if (ship) {
-      if (ship.team === 0) this.state.blueCount = Math.max(0, this.state.blueCount - 1);
-      else this.state.redCount = Math.max(0, this.state.redCount - 1);
-    }
-    this.state.ships.delete(client.sessionId);
-    this.sim.delete(client.sessionId);
+    this.removeShip(client.sessionId);
+  }
+
+  // Fully evict a pilot from the room: drop the replicated ship, the server-side sim scratch, any
+  // bolts/missiles tied to them, and reassign the host if they held it. Shared by the clean-leave
+  // path (onLeave) and the ghost reaper (a client that vanished without a clean disconnect), so a
+  // stuck lobby/arena entry is removed the same way no matter how the pilot left.
+  removeShip(sessionId) {
+    const ship = this.state.ships.get(sessionId);
+    if (!ship) { this.sim.delete(sessionId); return; }
+    if (ship.team === 0) this.state.blueCount = Math.max(0, this.state.blueCount - 1);
+    else this.state.redCount = Math.max(0, this.state.redCount - 1);
+    this.state.ships.delete(sessionId);
+    this.sim.delete(sessionId);
     // Drop any live bolts this player owned so they don't hang around ownerless.
     for (const [id, bolt] of this.state.bolts) {
-      if (bolt.owner === client.sessionId) this.state.bolts.delete(id);
+      if (bolt.owner === sessionId) this.state.bolts.delete(id);
     }
     // Drop any live missiles this player owned or was the target of (so a homing dart doesn't chase
     // a ghost after its target left).
     for (const [id, m] of this.state.missiles) {
-      if (m.owner === client.sessionId || m.target === client.sessionId) this.state.missiles.delete(id);
+      if (m.owner === sessionId || m.target === sessionId) this.state.missiles.delete(id);
     }
     // If the HOST left, hand the crown to whoever remains (first ship in the map) so the lobby can
     // still be configured/started. Empties to '' when the room drains.
-    if (this.state.host === client.sessionId) {
+    if (this.state.host === sessionId) {
       let next = '';
       for (const sid of this.state.ships.keys()) { next = sid; break; }
       this.state.host = next;
@@ -380,6 +412,19 @@ export class ArenaRoom extends Room {
   // process death/respawn. Everything here is server truth; clients only render the replicated state.
   tick() {
     this._now += FIXED_DT;
+
+    // --- 0a) Ghost reaper -------------------------------------------------------------------------
+    // Evict any pilot we haven't heard from in STALE_SHIP_TIMEOUT seconds. lastSeen is refreshed by
+    // every input AND every netprobe echo (~2/sec on a healthy connection), so a live pilot — even
+    // one idling in the lobby — never trips this, while a client that closed its tab, crashed, or
+    // dropped its connection ungracefully (and never fired a clean onLeave) is cleaned out here.
+    for (const [sid, s] of this.sim) {
+      if (this._now - (s.lastSeen || 0) > STALE_SHIP_TIMEOUT) {
+        const ship = this.state.ships.get(sid);
+        console.log(`[arena] reaping ghost pilot ${ship ? ship.name : sid} (silent ${STALE_SHIP_TIMEOUT}s) [roomId=${this.roomId}]`);
+        this.removeShip(sid);
+      }
+    }
 
     // --- 0) Round clock (Squadron Death Match) ------------------------------------------------
     // Only counts while the match is LIVE. Decrement toward 0, clamp at 0 (never go negative), and
@@ -825,19 +870,21 @@ export class ArenaRoom extends Room {
   // around the team anchor and biased AWAY from live enemies (see pickRespawnPoint) so a pilot warps
   // back into open space instead of the kill-box they just died in.
   respawnShip(sid, ship, s) {
-    const sp = SPAWN[ship.team] || SPAWN[0];
     const rp = this.pickRespawnPoint(ship.team);
     s.pos.x = rp.x; s.pos.y = rp.y; s.pos.z = rp.z;
-    if (sp.faceZ === 1) { s.quat.x = 0; s.quat.y = 1; s.quat.z = 0; s.quat.w = 0; }
-    else { s.quat.x = 0; s.quat.y = 0; s.quat.z = 0; s.quat.w = 1; }
-    // Give the fresh ship a forward WARP-IN velocity down its nose (local -Z) so the client renders a
-    // proper streaking arrival like the mission-start warp-in, not a dead stop. faceZ === 1 means the
-    // hull is yawed 180° so its nose points +Z; otherwise the nose points -Z.
+    // Face the enemy anchor from wherever the scatter placed us, so a respawn also warps in aimed at
+    // the fight rather than straight down a fixed axis.
+    const rq = yawQuatToward({ x: rp.x, y: rp.y, z: rp.z }, ENEMY_ANCHOR[ship.team]);
+    s.quat.x = rq.x; s.quat.y = rq.y; s.quat.z = rq.z; s.quat.w = rq.w;
+    // Give the fresh ship a forward WARP-IN velocity down its ACTUAL nose (local -Z rotated by the
+    // facing quat) so the client renders a streaking arrival toward the fight, not a dead stop.
     const RESPAWN_WARP_SPEED = 30;
-    const fz = sp.faceZ === 1 ? 1 : -1;
-    s.vel.x = 0; s.vel.y = 0; s.vel.z = fz * RESPAWN_WARP_SPEED;
+    const fwd = forwardFromQuat(s.quat);
+    s.vel.x = fwd.x * RESPAWN_WARP_SPEED;
+    s.vel.y = fwd.y * RESPAWN_WARP_SPEED;
+    s.vel.z = fwd.z * RESPAWN_WARP_SPEED;
     ship.px = s.pos.x; ship.py = s.pos.y; ship.pz = s.pos.z;
-    ship.vx = 0; ship.vy = 0; ship.vz = s.vel.z;
+    ship.vx = s.vel.x; ship.vy = s.vel.y; ship.vz = s.vel.z;
     ship.qx = s.quat.x; ship.qy = s.quat.y; ship.qz = s.quat.z; ship.qw = s.quat.w;
     ship.hull = s.maxHull || 100;
     ship.shields = s.maxShields || 100;
