@@ -69,8 +69,15 @@ export function integrateQuat(q, pitch, yaw, roll) {
 export function yawQuatToward(from, to) {
   const dx = to.x - from.x;
   const dz = to.z - from.z;
-  // For a +Y rotation, (0,0,-1) maps to (sin θ, 0, -cos θ); solve so that vector == (dx,0,dz).
-  const yaw = Math.atan2(dx, -dz);
+  // forwardFromQuat for a PURE yaw q=(0,sin(h),0,cos(h)) evaluates to nose = (-sin(yaw), 0, -cos(yaw))
+  // (see forwardFromQuat below: x=-2·w·y=-sin(yaw), z=-(1-2y²)=-cos(yaw)). We want that nose to point
+  // along (dx,0,dz), so: -sin(yaw)=dx/|d| and -cos(yaw)=dz/|d| ⟹ yaw = atan2(-dx, -dz).
+  //
+  // The previous atan2(dx, -dz) put the correct Z sign but INVERTED the X component: a ship spawning
+  // on one diagonal corner aimed correctly toward -Z but toward the WRONG side on X, so the two teams'
+  // noses splayed apart on the X axis and slid past each other — "both flying away while locked on".
+  // This form makes forwardFromQuat point exactly at the enemy anchor on BOTH axes.
+  const yaw = Math.atan2(-dx, -dz);
   const h = yaw / 2;
   return { x: 0, y: Math.sin(h), z: 0, w: Math.cos(h) };
 }

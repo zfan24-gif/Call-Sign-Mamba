@@ -125,7 +125,7 @@ const RESPAWN_CANDIDATES = 8;       // sample this many points, keep the safest 
 // ship we haven't heard from in STALE_SHIP_TIMEOUT seconds. This self-heals ghosts no matter how the
 // client vanished. A LIVE client sends input every frame; even a lobby-idle client's UI polls the
 // server, so a healthy connection refreshes lastSeen well inside this window.
-const STALE_SHIP_TIMEOUT = 12;      // seconds of total silence before a ship is treated as a ghost and removed
+const STALE_SHIP_TIMEOUT = 8;      // seconds of total silence before a ship is treated as a ghost and removed
 
 export class ArenaRoom extends Room {
   onCreate(options) {
@@ -177,6 +177,8 @@ export class ArenaRoom extends Room {
     // `speaking` flag so every pilot can render who's on the radio; the actual audio rides a separate
     // WebRTC/SFU layer. We DON'T rate-limit this (it's a low-frequency edge event: pressed / released).
     this.onMessage('voice', (client, msg) => {
+      const s = this.sim.get(client.sessionId);
+      if (s) s.lastSeen = this._now;   // interaction heartbeat
       const ship = this.state.ships.get(client.sessionId);
       if (!ship) return;
       ship.speaking = !!(msg && msg.talking);
@@ -255,6 +257,8 @@ export class ArenaRoom extends Room {
     // READY-CHECK: any pilot toggles their own ready flag in the lobby. Replicated so every lobby
     // shows the live ready pips. Only meaningful in the lobby; a ready flag set mid-round is harmless.
     this.onMessage('setReady', (client, msg) => {
+      const s = this.sim.get(client.sessionId);
+      if (s) s.lastSeen = this._now;   // interaction heartbeat
       const ship = this.state.ships.get(client.sessionId);
       if (!ship) return;
       ship.ready = !!(msg && msg.ready);
