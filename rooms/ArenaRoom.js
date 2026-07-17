@@ -10,7 +10,7 @@
 // out with TODO markers where they'll slot in.
 import { Room } from '@colyseus/core';
 import { ArenaState, Ship, Bolt, Missile } from './schema.js';
-import { stepShip, forwardFromQuat, yawQuatToward } from '../shared/flightModel.js';
+import { stepShip, forwardFromQuat, yawQuatToward, applyQuat } from '../shared/flightModel.js';
 import { sanitizeShip, statsFor } from './shipStats.js';
 
 const TICK_HZ = 30;                 // authoritative simulation rate
@@ -358,6 +358,7 @@ export class ArenaRoom extends Room {
       // Combat scratch (server-only, never replicated):
       fireCd: 0,        // seconds remaining until this player can fire again
       missileCd: 0,     // seconds remaining until this player can launch another missile
+      muzzleIdx: 0,     // index of the next cannon to fire (for alternating fire)
       lastHitAt: -999,  // sim time of last damage taken (gates shield regen)
       respawnAt: 0,     // sim time to respawn at (when dead)
       killStreak: 0,    // confirmed kills THIS LIFE (drives the missile-resupply reward; reset on death)
@@ -606,14 +607,23 @@ export class ArenaRoom extends Room {
     if (this.state.bolts.size >= MAX_BOLTS) return;
     s.fireCd = FIRE_COOLDOWN;
 
+    // Authoritative muzzle placement: every hull has its own calibrated muzzle offsets (see shipStats.js).
+    // We cycle through the cannons each shot so lasers fire from the actual wing/nose guns.
+    const st = statsFor(ship.ship);
+    const muzzles = st.muzzles || [{ x: 0, y: 0, z: -BOLT_MUZZLE }];
+    const localMuzzle = muzzles[s.muzzleIdx % muzzles.length];
+    s.muzzleIdx = (s.muzzleIdx + 1) % muzzles.length;
+
     const fwd = forwardFromQuat(s.quat);      // unit nose vector
+    const worldMuzzle = applyQuat(s.quat, localMuzzle);
+
     const bolt = new Bolt();
     bolt.owner = sessionId;
     bolt.team = ship.team;
-    // Spawn just ahead of the muzzle, inheriting the ship's velocity plus bolt speed along the nose.
-    bolt.px = s.pos.x + fwd.x * BOLT_MUZZLE;
-    bolt.py = s.pos.y + fwd.y * BOLT_MUZZLE;
-    bolt.pz = s.pos.z + fwd.z * BOLT_MUZZLE;
+    // Spawn at the world muzzle position, inheriting ship velocity + bolt speed along the nose.
+    bolt.px = s.pos.x + worldMuzzle.x;
+    bolt.py = s.pos.y + worldMuzzle.y;
+    bolt.pz = s.pos.z + worldMuzzle.z;
     bolt.vx = s.vel.x + fwd.x * BOLT_SPEED;
     bolt.vy = s.vel.y + fwd.y * BOLT_SPEED;
     bolt.vz = s.vel.z + fwd.z * BOLT_SPEED;

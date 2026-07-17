@@ -82,6 +82,22 @@ export function yawQuatToward(from, to) {
   return { x: 0, y: Math.sin(h), z: 0, w: Math.cos(h) };
 }
 
+// Rotate a 3D vector v by quaternion q. Returns {x,y,z}.
+export function applyQuat(q, v) {
+  const qx = q.x, qy = q.y, qz = q.z, qw = q.w;
+  const vx = v.x, vy = v.y, vz = v.z;
+
+  const tx = 2 * (qy * vz - qz * vy);
+  const ty = 2 * (qz * vx - qx * vz);
+  const tz = 2 * (qx * vy - qy * vx);
+
+  return {
+    x: vx + qw * tx + (qy * tz - qz * ty),
+    y: vy + qw * ty + (qz * tx - qx * tz),
+    z: vz + qw * tz + (qx * ty - qy * tx)
+  };
+}
+
 // Rotate the unit vector (0,0,-1) — the ship's nose — by quaternion q. Returns {x,y,z}.
 export function forwardFromQuat(q) {
   // v = (0,0,-1). Standard q * v * q^-1 specialized for v=(0,0,-1).
