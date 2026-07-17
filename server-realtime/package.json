@@ -1,0 +1,21 @@
+{
+  "name": "call-sign-mamba-realtime",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Authoritative Colyseus game server for Call Sign Mamba 12v12 multiplayer (movement, combat, missile ammo, voice-token minting).",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "@colyseus/core": "^0.15.17",
+    "@colyseus/schema": "^2.0.35",
+    "@colyseus/ws-transport": "^0.15.0",
+    "colyseus": "^0.15.17",
+    "livekit-server-sdk": "^2.7.2"
+  }
+}
