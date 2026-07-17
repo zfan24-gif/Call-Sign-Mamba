@@ -11,45 +11,12 @@
 //   • missiles → starting/max guided-missile loadout for this hull (authoritative ammo cap)
 // Advantages are intentionally SMALL (±10–25%) so no single hull dominates.
 const SHIP_STATS = {
-  lightning: {
-    shield: 1.0, hull: 1.0, speed: 1.0, firepower: 1.0, missiles: 4,
-    muzzles: [
-      { x: -1.0, y: 0.0, z: -3.0 }, { x: 1.0, y: 0.0, z: -3.0 },
-      { x: -1.7, y: -0.6, z: -3.0 }, { x: 1.7, y: -0.6, z: -3.0 }
-    ]
-  },
-  fury: {
-    shield: 1.0, hull: 1.12, speed: 0.9, firepower: 1.18, missiles: 4,
-    muzzles: [
-      { x: 1.0, y: 0.0, z: -0.06 }, { x: -1.0, y: 0.0, z: 0.0 },
-      { x: 1.0, y: -0.34, z: -0.73 }, { x: -1.0, y: -0.28, z: -0.90 }
-    ]
-  },
-  concept: {
-    shield: 1.2, hull: 1.0, speed: 1.05, firepower: 0.9, missiles: 5,
-    muzzles: [
-      { x: -0.7, y: 0.0, z: -2.3 }, { x: 0.7, y: 0.0, z: -2.3 }
-    ]
-  },
-  interceptor: {
-    shield: 0.85, hull: 0.9, speed: 1.2, firepower: 1.0, missiles: 4,
-    muzzles: [
-      { x: -0.44, y: -0.32, z: -0.63 }, { x: 0.44, y: -0.31, z: -0.58 }
-    ]
-  },
-  fighter: {
-    shield: 1.08, hull: 1.06, speed: 0.96, firepower: 1.0, missiles: 4,
-    muzzles: [
-      { x: -0.1, y: -0.28, z: -2.35 }, { x: 0.15, y: -0.28, z: -2.31 }
-    ]
-  },
-  bomber: {
-    shield: 1.05, hull: 1.2, speed: 0.82, firepower: 1.25, missiles: 6,
-    muzzles: [
-      { x: -0.62, y: -0.12, z: -2.85 }, { x: 0.62, y: -0.12, z: -2.85 },
-      { x: -0.52, y: -0.56, z: -2.66 }, { x: 0.52, y: -0.52, z: -2.76 }
-    ]
-  },
+  lightning:   { shield: 1.0,  hull: 1.0,  speed: 1.0,  firepower: 1.0,  missiles: 4 },
+  fury:        { shield: 1.0,  hull: 1.12, speed: 0.9,  firepower: 1.18, missiles: 4 },
+  concept:     { shield: 1.2,  hull: 1.0,  speed: 1.05, firepower: 0.9,  missiles: 5 },
+  interceptor: { shield: 0.85, hull: 0.9,  speed: 1.2,  firepower: 1.0,  missiles: 4 },
+  fighter:     { shield: 1.08, hull: 1.06, speed: 0.96, firepower: 1.0,  missiles: 4 },
+  bomber:      { shield: 1.05, hull: 1.2,  speed: 0.82, firepower: 1.25, missiles: 6 },
 };
 
 const DEFAULT_SHIP = 'lightning';

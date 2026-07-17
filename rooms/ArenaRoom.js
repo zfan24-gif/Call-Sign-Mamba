@@ -10,7 +10,7 @@
 // out with TODO markers where they'll slot in.
 import { Room } from '@colyseus/core';
 import { ArenaState, Ship, Bolt, Missile } from './schema.js';
-import { stepShip, forwardFromQuat, yawQuatToward, applyQuat } from '../shared/flightModel.js';
+import { stepShip, forwardFromQuat, yawQuatToward } from '../shared/flightModel.js';
 import { sanitizeShip, statsFor } from './shipStats.js';
 
 const TICK_HZ = 30;                 // authoritative simulation rate
@@ -26,10 +26,14 @@ const BOLT_LIFETIME = 1.6;          // seconds before a bolt expires
 const BOLT_DAMAGE = 12;             // damage per hit
 const BOLT_MUZZLE = 6;              // spawn this far ahead of the nose so we never self-collide
 const FIRE_COOLDOWN = 0.14;         // min seconds between a player's shots (server-enforced rate cap)
-// Ship hit sphere radius (units). Sized so laser hits register out to ~200-220m of aim: the swept
-// segment test plus this radius forgive the small aim/latency error at range, so a bolt lined up on
-// a distant contact still counts. Bolts still expire by BOLT_LIFETIME (520 u/s * 1.6s ~= 832u max).
-const HIT_RADIUS = 14;
+// Ship hit sphere radius (units). Sized to HUG the actual fighter hull rather than a generous aim
+// bubble, so a bolt only counts as a hit when it genuinely passes through the ship — not when it
+// sails visibly wide. Playable hulls are ~4.6-6.2 units long (see shipRoster.js `len`), giving a
+// real hull half-extent of roughly 3 units including wingspan; we add a SMALL latency/aim margin on
+// top so a well-aimed shot at a moving target at range still connects, without making misses count.
+// This is the "you can only hit what you're actually pointing at" fix: it was 14 (a bubble 2-3x the
+// whole ship), which registered clear misses as kills. Bolts still expire by BOLT_LIFETIME.
+const HIT_RADIUS = 4.5;
 const SHIELD_REGEN = 9;             // shield charge/sec, regenerates when not recently hit
 const SHIELD_REGEN_DELAY = 3;       // seconds after taking a hit before shields recharge
 
@@ -58,17 +62,23 @@ const MAX_BOLTS = 400;              // hard cap on live bolts (safety)
 // rams alike. A short per-pair cooldown keeps a sustained scrape from machine-gunning damage every
 // tick. This is intentionally lighter than a bolt hit so ramming is punishing but not a reliable
 // one-shot weapon.
-const SHIP_COLLIDE_RADIUS = 8;      // hull collision sphere radius (units) — snug to the fighter hull
+const SHIP_COLLIDE_RADIUS = 3.2;    // hull collision sphere radius (units) — snug to the fighter hull
+// (was 8: centers within 16u "rammed", ~3x the ship, so ships collided through empty space between
+// them. At 3.2 a ram only triggers when the hulls actually overlap — logical contact only.)
 const SHIP_COLLIDE_DAMAGE = 22;     // damage dealt to EACH ship per collision event
 const SHIP_COLLIDE_COOLDOWN = 0.6;  // seconds before the same pair can collide-damage again
-const SHIP_COLLIDE_PUSH = 6;        // extra separation (units) added on top of un-overlapping
+const SHIP_COLLIDE_PUSH = 2;        // extra separation (units) added on top of un-overlapping
+// (scaled down with the tighter collide radius so a light clip doesn't fling ships apart)
 
 // --- Guided missiles (heavy, homing) ----------------------------------------------------------
 const MISSILE_SPEED = 300;          // units/sec cruise speed
 const MISSILE_LIFETIME = 6.0;       // seconds before a missile self-expires
 const MISSILE_MUZZLE = 5;           // spawn this far ahead of the nose
 const MISSILE_DAMAGE = 120;         // heavy warhead (roughly one-shots most hulls through shields)
-const MISSILE_HIT_RADIUS = 16;      // proximity-fuse blast radius
+const MISSILE_HIT_RADIUS = 7;       // proximity-fuse blast radius
+// (was 16 — a bubble ~3x the ship, so a missile "detonated" on targets it clearly flew wide of. 7 is
+// a plausible warhead proximity fuse: a bit larger than a bolt's hull test since a warhead has real
+// blast area, but tight enough that it only fuses on a target it genuinely reaches.)
 const MISSILE_COOLDOWN = 1.4;       // min seconds between a player's missile shots
 const MAX_MISSILES = 120;           // hard cap on live missiles (safety)
 // Authoritative loadout economy: a pilot starts each life with their hull's rack (shipStats.missiles),
@@ -358,7 +368,6 @@ export class ArenaRoom extends Room {
       // Combat scratch (server-only, never replicated):
       fireCd: 0,        // seconds remaining until this player can fire again
       missileCd: 0,     // seconds remaining until this player can launch another missile
-      muzzleIdx: 0,     // index of the next cannon to fire (for alternating fire)
       lastHitAt: -999,  // sim time of last damage taken (gates shield regen)
       respawnAt: 0,     // sim time to respawn at (when dead)
       killStreak: 0,    // confirmed kills THIS LIFE (drives the missile-resupply reward; reset on death)
@@ -607,23 +616,14 @@ export class ArenaRoom extends Room {
     if (this.state.bolts.size >= MAX_BOLTS) return;
     s.fireCd = FIRE_COOLDOWN;
 
-    // Authoritative muzzle placement: every hull has its own calibrated muzzle offsets (see shipStats.js).
-    // We cycle through the cannons each shot so lasers fire from the actual wing/nose guns.
-    const st = statsFor(ship.ship);
-    const muzzles = st.muzzles || [{ x: 0, y: 0, z: -BOLT_MUZZLE }];
-    const localMuzzle = muzzles[s.muzzleIdx % muzzles.length];
-    s.muzzleIdx = (s.muzzleIdx + 1) % muzzles.length;
-
     const fwd = forwardFromQuat(s.quat);      // unit nose vector
-    const worldMuzzle = applyQuat(s.quat, localMuzzle);
-
     const bolt = new Bolt();
     bolt.owner = sessionId;
     bolt.team = ship.team;
-    // Spawn at the world muzzle position, inheriting ship velocity + bolt speed along the nose.
-    bolt.px = s.pos.x + worldMuzzle.x;
-    bolt.py = s.pos.y + worldMuzzle.y;
-    bolt.pz = s.pos.z + worldMuzzle.z;
+    // Spawn just ahead of the muzzle, inheriting the ship's velocity plus bolt speed along the nose.
+    bolt.px = s.pos.x + fwd.x * BOLT_MUZZLE;
+    bolt.py = s.pos.y + fwd.y * BOLT_MUZZLE;
+    bolt.pz = s.pos.z + fwd.z * BOLT_MUZZLE;
     bolt.vx = s.vel.x + fwd.x * BOLT_SPEED;
     bolt.vy = s.vel.y + fwd.y * BOLT_SPEED;
     bolt.vz = s.vel.z + fwd.z * BOLT_SPEED;

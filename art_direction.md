@@ -1,6 +1,0 @@
-- Style: retro-modern space sim inspired by 90s cockpit combat, clean high-contrast sci-fi readability.
-- Mood: tense dogfight in deep space, luminous HUDs, tactical cockpit immersion.
-- Palette: black/navy space, cyan HUD, amber warnings, red enemies, green shields.
-- Lighting: starfield glow, emissive panels, neon instrument edges.
-- Generate: cockpit frame/HUD trim, starfield background, enemy fighter silhouettes, capital ship silhouette, card frames, targeting reticle/VFX.
-- Enemy asset notes: transparent, readable front/three-quarter silhouettes with angular wings for later 3D modeling.

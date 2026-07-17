@@ -1,4 +1,0 @@
-- Music: loopable tense electronic space combat bed, medium-high energy, not too busy.
-- Core SFX: laser cannon shot, shield hit/impact, UI power-routing/card select chirp.
-- Audio should start/unlock on first player gesture with mute toggle.
-- Mix: music low, SFX crisp and readable over engine hum/procedural cockpit beeps.
