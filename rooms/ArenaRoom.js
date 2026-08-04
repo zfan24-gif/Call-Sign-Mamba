@@ -85,7 +85,10 @@ const MAX_MISSILES = 120;           // hard cap on live missiles (safety)
 // spends one per launch (a launch with an empty rack is REJECTED server-side), and earns one back for
 // every KILL_STREAK_REWARD confirmed kills this life — capped at the hull's rack size so it can't
 // overflow. Tracked server-side so a tampered client can't grant itself unlimited missiles.
-const KILL_STREAK_REWARD = 3;       // kills-per-bonus-missile
+const KILL_STREAK_REWARD = 3;       // kills-per-bonus-missile (Squadron Death Match)
+// In FREE-FOR-ALL the fight is denser and every-man-for-himself, so missiles resupply faster: one
+// bonus round every KILL_STREAK_REWARD_FFA confirmed kills this life (vs every 3 in SDM).
+const KILL_STREAK_REWARD_FFA = 2;   // kills-per-bonus-missile (Free-For-All)
 // Missile ENGAGEMENT ENVELOPE (must mirror the client's MISSILE_LOCK_RANGE / turn constants in
 // main.js so single-player and arena behave the same). A lock/launch is rejected beyond
 // MISSILE_LOCK_RANGE. Launch distance sets the seeker's turn authority: a close shot is agile and
@@ -127,6 +130,12 @@ const ENEMY_ANCHOR = {
 // respawning pilot lands away from the pack that just killed them.
 const RESPAWN_SPREAD = 220;         // units around the team anchor a respawn may scatter
 const RESPAWN_CANDIDATES = 8;       // sample this many points, keep the safest (farthest from enemies)
+
+// FREE-FOR-ALL spawn field: there are no team anchors, so pilots scatter across a big sphere around
+// the arena origin. Spawn/respawn samples several random points in this radius and keeps the one
+// FARTHEST from the nearest live rival, so a fresh pilot never materializes on top of the pack.
+const FFA_SPAWN_RADIUS = 360;       // units from origin an FFA (re)spawn may scatter
+const FFA_SPAWN_CANDIDATES = 10;    // sample this many points, keep the safest (farthest from any rival)
 
 // Ghost reaper: a client that closed its tab, crashed, or dropped WiFi ungracefully doesn't always
 // trigger a prompt onLeave — Colyseus may hold the seat waiting for a clean close that never comes,
@@ -229,7 +238,8 @@ export class ArenaRoom extends Room {
       if (client.sessionId !== this.state.host) return;      // only the host configures
       if (this.state.matchState !== 'lobby') return;          // no reconfiguring a live/ended round
       if (!msg) return;
-      if (msg.mode === 'sdm') this.state.mode = 'sdm';        // only SDM exists for now
+      // Whitelist the mode: Squadron Death Match (teams) or Free-For-All (every-man-for-himself).
+      if (msg.mode === 'sdm' || msg.mode === 'ffa') this.state.mode = msg.mode;
       const d = Number(msg.roundDuration);
       if (ROUND_DURATIONS.includes(d)) {
         this.state.roundDuration = d;
@@ -245,7 +255,8 @@ export class ArenaRoom extends Room {
       const ship = this.state.ships.get(client.sessionId);
       const s = this.sim.get(client.sessionId);
       if (!ship || !s || !msg) return;
-      const shipId = sanitizeShip(msg.ship, ship.team);   // team-filtered validation
+      // FFA: any of the 6 hulls is legal (team=-1 skips the filter). SDM: team-filtered.
+      const shipId = sanitizeShip(msg.ship, this.isFFA() ? -1 : ship.team);
       if (shipId === ship.ship) return;
       const st = statsFor(shipId);
       ship.ship = shipId;
@@ -315,10 +326,18 @@ export class ArenaRoom extends Room {
     return blue <= red ? 0 : 1;
   }
 
+  // True while this room is running a Free-For-All (no teams; winner = top-kills pilot). Used to
+  // gate the team-only behaviors: team ship-roster filtering, friendly-fire exemption, team spawn
+  // anchors, and team-vs-team scoring all switch off in FFA.
+  isFFA() { return this.state.mode === 'ffa'; }
+
   onJoin(client, options) {
-    const team = this.pickTeam();
+    const ffa = this.isFFA();
+    // FFA has no teams. We still assign team 0 for schema tidiness, but pass team=-1 to sanitizeShip
+    // so ANY of the 6 hulls is legal, and combat/scoring treat everyone as a lone rival.
+    const team = ffa ? 0 : this.pickTeam();
     const name = sanitizeName(options && options.name);
-    const shipId = sanitizeShip(options && options.ship, team);   // team-filtered (blue heroes / red enemies)
+    const shipId = sanitizeShip(options && options.ship, ffa ? -1 : team);   // FFA: any hull; SDM: team-filtered
     const st = statsFor(shipId);
     const ship = new Ship();
     ship.name = name;
@@ -339,14 +358,22 @@ export class ArenaRoom extends Room {
     ship.maxMissiles = maxMissiles;
     ship.missiles = maxMissiles;
 
-    // Seat the ship at its team spawn, nose pointed inward toward the fight.
-    const sp = SPAWN[team];
-    ship.px = sp.pos[0]; ship.py = sp.pos[1]; ship.pz = sp.pos[2];
-    // Aim the nose directly at the ENEMY anchor so both teams spawn nose-to-nose for a head-on
-    // opening pass, instead of each pointing straight down its own Z axis (parallel headings that
-    // slide past each other and read as "flying away from each other").
-    const q = yawQuatToward({ x: sp.pos[0], y: sp.pos[1], z: sp.pos[2] }, ENEMY_ANCHOR[team]);
-    ship.qx = q.x; ship.qy = q.y; ship.qz = q.z; ship.qw = q.w;
+    // Seat the ship. In SDM it spawns at its team anchor nosed at the enemy anchor; in FFA it
+    // scatters across the arena field (biased away from rivals) and noses back toward the origin.
+    if (ffa) {
+      const rp = this.pickFFASpawnPoint(null);
+      ship.px = rp.x; ship.py = rp.y; ship.pz = rp.z;
+      const q = yawQuatToward({ x: rp.x, y: rp.y, z: rp.z }, { x: 0, y: 0, z: 0 });
+      ship.qx = q.x; ship.qy = q.y; ship.qz = q.z; ship.qw = q.w;
+    } else {
+      const sp = SPAWN[team];
+      ship.px = sp.pos[0]; ship.py = sp.pos[1]; ship.pz = sp.pos[2];
+      // Aim the nose directly at the ENEMY anchor so both teams spawn nose-to-nose for a head-on
+      // opening pass, instead of each pointing straight down its own Z axis (parallel headings that
+      // slide past each other and read as "flying away from each other").
+      const q = yawQuatToward({ x: sp.pos[0], y: sp.pos[1], z: sp.pos[2] }, ENEMY_ANCHOR[team]);
+      ship.qx = q.x; ship.qy = q.y; ship.qz = q.z; ship.qw = q.w;
+    }
 
     this.state.ships.set(client.sessionId, ship);
     if (team === 0) this.state.blueCount++; else this.state.redCount++;
@@ -650,11 +677,12 @@ export class ArenaRoom extends Room {
     // within the engagement envelope. A lock is REJECTED beyond MISSILE_LOCK_RANGE (the seeker can't
     // acquire that far off); such a launch degrades to a straight dumbfire. Otherwise the launch
     // distance sets the seeker's turn authority (close = agile, far = easy to evade).
+    const ffa = this.isFFA();   // FFA: any live non-self ship is lockable (no team restriction)
     let lockId = '';
     let launchTurn = MISSILE_TURN_NEAR;   // dumbfire default (unused for straight flight)
     if (typeof targetId === 'string' && targetId && targetId !== sessionId) {
       const tgt = this.state.ships.get(targetId);
-      if (tgt && tgt.alive && tgt.team !== ship.team) {
+      if (tgt && tgt.alive && (ffa || tgt.team !== ship.team)) {
         const ddx = tgt.px - s.pos.x, ddy = tgt.py - s.pos.y, ddz = tgt.pz - s.pos.z;
         const range = Math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz);
         if (range <= MISSILE_LOCK_RANGE) { lockId = targetId; launchTurn = missileTurnForRange(range); }
@@ -683,6 +711,7 @@ export class ArenaRoom extends Room {
   // Home every missile toward its locked target (turn-rate limited), advance it, and proximity-fuse
   // against any live hostile within blast radius. Expires by lifetime. Detonation deals a heavy hit.
   advanceMissiles() {
+    const ffa = this.isFFA();   // FFA: a missile homes on / fuses against any live non-owner ship
     for (const [id, m] of this.state.missiles) {
       m._ttl -= FIXED_DT;
 
@@ -690,7 +719,7 @@ export class ArenaRoom extends Room {
       // rotated toward the target-bearing by at most m._turn*dt this tick (turn-rate limited),
       // then re-normalized to cruise speed so the dart keeps a constant speed while it homes.
       const tgt = m.target && this.state.ships.get(m.target);
-      if (tgt && tgt.alive && tgt.team !== m.team) {
+      if (tgt && tgt.alive && (ffa || tgt.team !== m.team)) {
         const tx = tgt.px - m.px, ty = tgt.py - m.py, tz = tgt.pz - m.pz;
         const td = Math.sqrt(tx * tx + ty * ty + tz * tz) || 1;
         const dx = tx / td, dy = ty / td, dz = tz / td;
@@ -723,7 +752,7 @@ export class ArenaRoom extends Room {
       for (const [sid, ship] of this.state.ships) {
         if (!ship.alive) continue;
         if (sid === m.owner) continue;
-        if (ship.team === m.team) continue;
+        if (!ffa && ship.team === m.team) continue;   // SDM: no friendly fuse (FFA: everyone but the owner)
         if (segmentHitsSphere(m.px, m.py, m.pz, nx, ny, nz, ship.px, ship.py, ship.pz, MISSILE_HIT_RADIUS)) {
           this.damageShip(sid, ship, MISSILE_DAMAGE, m.owner);
           // Broadcast so clients can render a big warhead blast at the impact point.
@@ -744,6 +773,7 @@ export class ArenaRoom extends Room {
   // Move every bolt, expire old ones, and test each against enemy-team ships (sphere check with a
   // segment sweep so fast bolts don't tunnel through a ship between ticks).
   advanceBolts() {
+    const ffa = this.isFFA();   // FFA: no friendly-fire exemption — everyone but the shooter is a target
     const rewound = this._rewoundScratch || (this._rewoundScratch = { x: 0, y: 0, z: 0 });
     for (const [id, bolt] of this.state.bolts) {
       // Advance and age.
@@ -762,7 +792,7 @@ export class ArenaRoom extends Room {
       for (const [sid, ship] of this.state.ships) {
         if (!ship.alive) continue;
         if (sid === bolt.owner) continue;       // never hit the shooter
-        if (ship.team === bolt.team) continue;  // no friendly fire
+        if (!ffa && ship.team === bolt.team) continue;  // SDM: no friendly fire (FFA: everyone's a target)
         // Test against the target's REWOUND center (its position at the shooter's view time), not its
         // live center — this is what makes a well-aimed shot at a moving target actually connect.
         const tsim = this.sim.get(sid);
@@ -827,14 +857,17 @@ export class ArenaRoom extends Room {
       const ks = this.sim.get(attackerId);
       if (ks) {
         ks.killStreak = (ks.killStreak || 0) + 1;
-        if (ks.killStreak % KILL_STREAK_REWARD === 0) {
+        // Missile resupply cadence: every 2 kills in FFA, every 3 in SDM.
+        const reward = this.isFFA() ? KILL_STREAK_REWARD_FFA : KILL_STREAK_REWARD;
+        if (ks.killStreak % reward === 0) {
           const cap = killer.maxMissiles || ks.maxMissiles || 4;
           if (killer.missiles < cap) killer.missiles = Math.min(cap, killer.missiles + 1);
         }
       }
-      // Credit the killer's TEAM with an opponent kill — this is the Squadron Death Match win
-      // metric. Only count while the match is live (post-round kills don't change the result).
-      if (this.state.matchState === 'live') {
+      // Credit the win metric. SDM tallies opponent kills per TEAM (blue vs red); FFA has no teams,
+      // so the win metric is simply each pilot's own `kills` count (bumped above) — no team tally.
+      // Only count while the match is live (post-round kills don't change the result).
+      if (this.state.matchState === 'live' && !this.isFFA()) {
         if (killer.team === 0) this.state.blueKills = (this.state.blueKills + 1) & 0xffff;
         else this.state.redKills = (this.state.redKills + 1) & 0xffff;
       }
@@ -880,15 +913,49 @@ export class ArenaRoom extends Room {
     return best;
   }
 
+  // Pick a FREE-FOR-ALL spawn point: sample several random points across the arena field and keep
+  // the one whose nearest LIVE rival (any pilot other than `excludeSid`) is farthest away, so a
+  // fresh/respawning pilot warps in clear of the pack. Falls back to a plain scatter with no rivals.
+  pickFFASpawnPoint(excludeSid) {
+    const rivals = [];
+    for (const [sid, ship] of this.state.ships) {
+      if (sid === excludeSid) continue;
+      if (ship.alive) rivals.push(ship);
+    }
+    const sample = () => {
+      // Uniform-ish point in a sphere around origin (rejection-free: random dir * random radius).
+      const u = Math.random() * 2 - 1, a = Math.random() * Math.PI * 2;
+      const r = FFA_SPAWN_RADIUS * Math.cbrt(Math.random());
+      const s = Math.sqrt(1 - u * u);
+      return { x: r * s * Math.cos(a), y: r * u, z: r * s * Math.sin(a) };
+    };
+    if (!rivals.length) return sample();
+    let best = sample(), bestScore = -Infinity;
+    for (let i = 0; i < FFA_SPAWN_CANDIDATES; i++) {
+      const c = sample();
+      let nearest = Infinity;
+      for (const e of rivals) {
+        const dx = e.px - c.x, dy = e.py - c.y, dz = e.pz - c.z;
+        const d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 < nearest) nearest = d2;
+      }
+      if (nearest > bestScore) { bestScore = nearest; best = c; }
+    }
+    return best;
+  }
+
   // Respawn with full hull/shields, facing inward, velocity zeroed. The spawn POINT is scattered
   // around the team anchor and biased AWAY from live enemies (see pickRespawnPoint) so a pilot warps
   // back into open space instead of the kill-box they just died in.
   respawnShip(sid, ship, s) {
-    const rp = this.pickRespawnPoint(ship.team);
+    const ffa = this.isFFA();
+    // FFA scatters across the arena field (away from any rival); SDM uses the team anchor scatter.
+    const rp = ffa ? this.pickFFASpawnPoint(sid) : this.pickRespawnPoint(ship.team);
     s.pos.x = rp.x; s.pos.y = rp.y; s.pos.z = rp.z;
-    // Face the enemy anchor from wherever the scatter placed us, so a respawn also warps in aimed at
-    // the fight rather than straight down a fixed axis.
-    const rq = yawQuatToward({ x: rp.x, y: rp.y, z: rp.z }, ENEMY_ANCHOR[ship.team]);
+    // Face the fight from wherever the scatter placed us: the enemy anchor in SDM, or the arena
+    // origin in FFA (the general middle of the action) — never straight down a fixed axis.
+    const aim = ffa ? { x: 0, y: 0, z: 0 } : ENEMY_ANCHOR[ship.team];
+    const rq = yawQuatToward({ x: rp.x, y: rp.y, z: rp.z }, aim);
     s.quat.x = rq.x; s.quat.y = rq.y; s.quat.z = rq.z; s.quat.w = rq.w;
     // Give the fresh ship a forward WARP-IN velocity down its ACTUAL nose (local -Z rotated by the
     // facing quat) so the client renders a streaking arrival toward the fight, not a dead stop.
@@ -987,6 +1054,10 @@ export class ArenaRoom extends Room {
     this.state.blueKills = 0;
     this.state.redKills = 0;
     this.state.winningTeam = -1;
+    // Clear any prior FFA result so a fresh round starts with no winner shown.
+    this.state.winnerId = '';
+    this.state.winnerName = '';
+    this.state.winnerKills = 0;
     // Clean slate: respawn every pilot, zero their per-round scoreboard, and clear the ready flags so
     // a future return to the lobby runs a fresh ready-check.
     for (const [sid, ship] of this.state.ships) {
@@ -1006,9 +1077,33 @@ export class ArenaRoom extends Room {
   endMatch() {
     if (this.state.matchState !== 'live') return;
     this.state.matchState = 'ended';
+
+    if (this.isFFA()) {
+      // FFA: the winner is the single pilot with the most kills. Ties (or nobody scoring) leave the
+      // winner blank -> the client shows a draw. We snapshot the name so the banner survives the
+      // pilot leaving after the round. `winningTeam` stays -1 (teams are meaningless in FFA).
+      let topId = '', topName = '', topKills = 0, tie = false;
+      for (const [sid, ship] of this.state.ships) {
+        if (ship.kills > topKills) { topKills = ship.kills; topId = sid; topName = ship.name; tie = false; }
+        else if (ship.kills === topKills && topKills > 0) { tie = true; }
+      }
+      if (tie || topKills === 0) { topId = ''; topName = ''; }
+      this.state.winningTeam = -1;
+      this.state.winnerId = topId;
+      this.state.winnerName = topName;
+      this.state.winnerKills = topKills;
+      this.broadcast('matchEnd', {
+        mode: 'ffa',
+        winnerId: topId, winnerName: topName, winnerKills: topKills,
+      });
+      console.log(`[arena] FFA MATCH END — winner=${topName || 'DRAW'} (${topKills} kills) [roomId=${this.roomId}]`);
+      return;
+    }
+
     const b = this.state.blueKills, r = this.state.redKills;
     this.state.winningTeam = b > r ? 0 : r > b ? 1 : -1;   // -1 = draw
     this.broadcast('matchEnd', {
+      mode: 'sdm',
       winningTeam: this.state.winningTeam,
       blueKills: b, redKills: r,
     });

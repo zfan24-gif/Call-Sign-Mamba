@@ -142,6 +142,12 @@ export class ArenaState extends Schema {
     this.redKills = 0;           // total enemy kills scored BY red team this round
     this.winningTeam = -1;       // -1 = undecided / draw; 0 = blue won; 1 = red won (set when matchState -> 'ended')
     this.host = '';              // sessionId of the lobby host (the pilot who may set config + start the match)
+    // --- Free-For-All result (only meaningful when mode === 'ffa') ---
+    // FFA has no teams: the winner is the single pilot with the most kills when the clock hits 0.
+    // These are set when an FFA match ends so every client can show the winning pilot banner.
+    this.winnerId = '';          // sessionId of the top-scoring pilot ('' = draw / nobody scored)
+    this.winnerName = '';        // that pilot's call sign (snapshot, survives them leaving)
+    this.winnerKills = 0;        // that pilot's kill count at match end
   }
 }
 defineTypes(ArenaState, {
@@ -158,4 +164,7 @@ defineTypes(ArenaState, {
   redKills: 'uint16',
   winningTeam: 'int8',
   host: 'string',
+  winnerId: 'string',
+  winnerName: 'string',
+  winnerKills: 'uint16',
 });

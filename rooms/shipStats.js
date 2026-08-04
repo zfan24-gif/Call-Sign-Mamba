@@ -29,6 +29,8 @@ function rosterFor(team) { return team === 1 ? RED_SHIPS : BLUE_SHIPS; }
 // Validate a client-supplied ship id; unknown ids fall back to a safe default. When a `team` is
 // given (0 blue / 1 red), the id is additionally required to belong to that team's roster —
 // anything off-roster falls back to that team's first hull (anti-tamper: red can't fly a hero hull).
+// Pass team === -1 (or null/undefined) to skip the team filter entirely: any of the 6 hulls is
+// valid. This is the FREE-FOR-ALL path, where there are no teams and every pilot may fly any ship.
 export function sanitizeShip(id, team) {
   const key = String(id || '').toLowerCase();
   if (team === 0 || team === 1) {
