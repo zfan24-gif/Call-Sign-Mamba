@@ -538,6 +538,11 @@ export class ArenaRoom extends Room {
       ship.vx = s.vel.x; ship.vy = s.vel.y; ship.vz = s.vel.z;
       ship.qx = s.quat.x; ship.qy = s.quat.y; ship.qz = s.quat.z; ship.qw = s.quat.w;
       ship.boost = !!input.boost;
+      // Authoritative "engines burning" flag for remote engine-trail length. True only while the
+      // pilot is actively thrusting forward or reversing this tick; a ship coasting on momentum
+      // (no throttle) reports false so observers render just a faint idle plume instead of a
+      // full accelerating trail. Mirrors the local player's own accel-driven exhaust.
+      ship.thrusting = !!(input.thrust || input.reverse);
       ship.lastSeq = s.lastSeq;
 
       // LAG COMPENSATION: record this tick's authoritative CENTER into the ring-buffer, then drop any

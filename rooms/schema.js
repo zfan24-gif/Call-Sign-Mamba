@@ -21,6 +21,12 @@ export class Ship extends Schema {
     this.qx = 0; this.qy = 0; this.qz = 0; this.qw = 1;    // orientation quaternion
     this.vx = 0; this.vy = 0; this.vz = 0;                 // velocity (sent so clients can extrapolate)
     this.boost = false;      // for remote engine-trail intensity
+    // True while the pilot is actively THRUSTING (forward or reverse) this tick. This is the
+    // authoritative "engines are burning" signal for remote engine-trail length: a coasting/idle
+    // ship (momentum only, no throttle) sets this false so observers show only a faint idle plume,
+    // and it goes true the instant the pilot throttles up so the trail extends. Replaces the old
+    // client-side accel guess, which read a fast COASTING ship as accelerating.
+    this.thrusting = false;
     this.lastSeq = 0;        // last processed input sequence for this player
     // --- Combat (Phase 2) ---
     this.hull = 100;         // 0..100 hull integrity; 0 = destroyed
@@ -64,6 +70,7 @@ defineTypes(Ship, {
   qx: 'float32', qy: 'float32', qz: 'float32', qw: 'float32',
   vx: 'float32', vy: 'float32', vz: 'float32',
   boost: 'boolean',
+  thrusting: 'boolean',
   lastSeq: 'uint32',
   hull: 'float32',
   shields: 'float32',
