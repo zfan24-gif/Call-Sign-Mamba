@@ -937,8 +937,11 @@ export class ArenaRoom extends Room {
     this.clearCargo();
     const pod = new Cargo();
     pod.team = CARGO_TEAM_NEUTRAL;   // neutral — contested by both teams
-    pod.modelIndex = Math.floor(Math.random() * CARGO_MODEL_COUNT);   // random container GLB this round
-    this.resetCargoHome(pod);
+    // Container GLB variant ROTATES per respawn within a single match (not per match). Seed the
+    // round-robin cursor at a random variant so different games don't all start on the same model,
+    // then resetCargoHome() advances it every time the flag returns home (capture / stale auto-return).
+    this._cargoModelSeq = Math.floor(Math.random() * CARGO_MODEL_COUNT);
+    this.resetCargoHome(pod, true);   // first spawn: use the seeded variant as-is (don't pre-advance)
     this.state.cargo.set('flag', pod);
   }
 
@@ -946,13 +949,19 @@ export class ArenaRoom extends Room {
     for (const key of [...this.state.cargo.keys()]) this.state.cargo.delete(key);
   }
 
-  // Park the pod at CENTER (loose/carry flags cleared).
-  resetCargoHome(pod) {
+  // Park the pod at CENTER (loose/carry flags cleared). Each time the flag RESPAWNS home (after a
+  // capture or a stale-drop auto-return) it also ROTATES to the next container GLB variant, so a
+  // single match cycles through all CARGO_MODEL_COUNT models. `initial=true` (first spawn only) keeps
+  // the seeded variant as-is instead of advancing, so the round-robin actually starts on the seed.
+  resetCargoHome(pod, initial = false) {
     const h = this.cargoHome();
     pod.px = h.x; pod.py = h.y; pod.pz = h.z;
     pod.carrier = '';
     pod.atHome = true;
     pod._dropAt = 0;   // server-only: sim time a loose pod auto-returns (unused while home/carried)
+    if (this._cargoModelSeq == null) this._cargoModelSeq = 0;
+    if (!initial) this._cargoModelSeq = (this._cargoModelSeq + 1) % CARGO_MODEL_COUNT;   // next variant on respawn
+    pod.modelIndex = this._cargoModelSeq;
   }
 
   // Drop whatever pod `sessionId` is carrying (on death or leave): the pod goes loose in space at
