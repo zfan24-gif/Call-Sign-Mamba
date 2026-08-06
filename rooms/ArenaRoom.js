@@ -122,6 +122,10 @@ const CARGO_PICKUP_RADIUS = 22;    // units — an enemy this close to a loose/h
 const CARGO_RETURN_RADIUS = 22;    // units — an owning-team pilot this close to a DROPPED pod returns it home
 const CARGO_CAPTURE_RADIUS = 60;   // units — a carrier this close to their own base scores a capture
 const CARGO_HOME_OFFSET = 40;      // units the resting pod sits in front of its base (toward the arena)
+// CTC bases sit MUCH farther apart than the SDM/FFA spawn anchors so a cargo run is a real trek
+// across the arena (not a few-second hop). We push each team's base OUT along its spawn-anchor
+// direction by this factor — scoped to CTC only, so SDM/FFA respawn distances are unchanged.
+const CTC_BASE_SPREAD = 3.2;       // ~735u apart at 1.0 -> ~2350u apart at 3.2
 // A pod dropped in space auto-returns home after this many seconds untouched, so a match can't
 // stall with a pod lost in the void nobody reclaims.
 const CARGO_DROP_TIMEOUT = 25;     // seconds a loose pod floats before auto-returning home
@@ -359,10 +363,13 @@ export class ArenaRoom extends Room {
   // pickup/carry/capture logic and the capture-based win condition.
   isCTC() { return this.state.mode === 'ctc'; }
 
-  // The world-space capital base center for a team (its spawn anchor).
+  // The world-space capital base center for a team. In CTC the base is pushed far out along the
+  // spawn-anchor direction (CTC_BASE_SPREAD) so the two capitals sit a long haul apart; in SDM/FFA
+  // this is just the raw spawn anchor.
   baseCenter(team) {
     const sp = SPAWN[team] || SPAWN[0];
-    return { x: sp.pos[0], y: sp.pos[1], z: sp.pos[2] };
+    const k = this.isCTC() ? CTC_BASE_SPREAD : 1;
+    return { x: sp.pos[0] * k, y: sp.pos[1] * k, z: sp.pos[2] * k };
   }
 
   // A team's cargo pod HOME rest position: a bit in front of its base, toward the arena origin, so
@@ -1067,8 +1074,16 @@ export class ArenaRoom extends Room {
   // the candidate whose nearest LIVE enemy is farthest away, so a respawning pilot warps in clear of
   // the opposing pack. Falls back to the plain anchor if there are no live enemies to avoid.
   pickRespawnPoint(team) {
-    const sp = SPAWN[team] || SPAWN[0];
-    const ax = sp.pos[0], ay = sp.pos[1], az = sp.pos[2];
+    // In CTC, anchor spawns to the (spread) team BASE so pilots warp in near their capital and
+    // naturally defend it; in SDM the raw spawn anchor is used.
+    let ax, ay, az;
+    if (this.isCTC()) {
+      const b = this.baseCenter(team);
+      ax = b.x; ay = b.y; az = b.z;
+    } else {
+      const sp = SPAWN[team] || SPAWN[0];
+      ax = sp.pos[0]; ay = sp.pos[1]; az = sp.pos[2];
+    }
     // Collect live enemy positions once.
     const enemies = [];
     for (const [, ship] of this.state.ships) {
