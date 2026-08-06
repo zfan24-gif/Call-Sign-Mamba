@@ -1005,6 +1005,13 @@ export class ArenaRoom extends Room {
         if (grabber) grabber.carrying = true;
         pod.carrier = claimedBy;
         pod.atHome = false;
+        // Broadcast a 'pickup' event so every client can play the grabber's TEAM pickup cue (and any
+        // HUD flash). Mirrors the 'capture' broadcast shape: team = the grabbing pilot's team.
+        this.broadcast('pickup', {
+          team: grabber ? grabber.team : -1,
+          carrier: claimedBy,
+          carrierName: grabber ? grabber.name : '',
+        });
         return;
       }
       // Auto-return a stale loose pod to center so a lost flag can't stall the match.
