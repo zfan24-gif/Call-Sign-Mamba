@@ -110,25 +110,35 @@ const ROUND_DURATIONS = [300, 600, 900, 1200];   // 5 / 10 / 15 / 20 minutes (se
 const DEFAULT_ROUND = 600;                        // 10 minutes
 
 // --- Capture the Cargo settings ----------------------------------------------------------------
-// A capture-the-flag mode: each team owns a cargo pod parked at its capital base. An ENEMY pilot
-// flies in, picks it up, and hauls it back to THEIR base to score. Match plays to a capture target
-// (host picks 4 / 7 / 10 in the lobby), or most captures when the round clock runs out.
+// A capture-the-flag mode with a SINGLE NEUTRAL cargo pod that spawns dead-center between the two
+// capital bases. EITHER team can grab it; a carrier scores by hauling it back to within
+// CARGO_CAPTURE_RADIUS of THEIR OWN base. Match plays to a capture target (host picks 4 / 7 / 10 in
+// the lobby), or most captures when the round clock runs out.
 const CAPTURE_TARGETS = [4, 7, 10];               // host-selectable captures-to-win whitelist
 const DEFAULT_CAPTURE_TARGET = 7;
-// The two capital "home bases" — reuse the team spawn anchors so a team defends where it spawns.
-// A pod rests a little in front of its base (toward the enemy anchor) so it's reachable, and a
-// capture completes when an enemy carrier gets within CARGO_CAPTURE_RADIUS of THEIR OWN base.
-const CARGO_PICKUP_RADIUS = 22;    // units — an enemy this close to a loose/home pod grabs it
-const CARGO_RETURN_RADIUS = 22;    // units — an owning-team pilot this close to a DROPPED pod returns it home
-const CARGO_CAPTURE_RADIUS = 60;   // units — a carrier this close to their own base scores a capture
-const CARGO_HOME_OFFSET = 40;      // units the resting pod sits in front of its base (toward the arena)
+// The single pod's HOME rest position is the arena CENTER (origin) — the midpoint between the two
+// bases. A pilot grabs it within CARGO_PICKUP_RADIUS and captures by returning to within
+// CARGO_CAPTURE_RADIUS of their own base.
+const CARGO_TEAM_NEUTRAL = 2;      // Cargo.team sentinel: the pod belongs to no team (contested by both)
+const CARGO_MODEL_COUNT = 4;       // number of container GLB variants (must match client CONTAINER_MODEL_URLS)
+const CARGO_PICKUP_RADIUS = 22;    // units — a pilot this close to the loose/center pod grabs it
+// A carrier captures by flying within 19u of their own base's SOLID HULL SURFACE. Since ships can't
+// pass through the base (BASE_COLLIDE_RADIUS), the capture test is measured from center as
+// (surface radius + 19) — i.e. hug the base within 19u and you score.
+const CARGO_CAPTURE_SURFACE_MARGIN = 19;
 // CTC bases sit MUCH farther apart than the SDM/FFA spawn anchors so a cargo run is a real trek
 // across the arena (not a few-second hop). We push each team's base OUT along its spawn-anchor
 // direction by this factor — scoped to CTC only, so SDM/FFA respawn distances are unchanged.
 const CTC_BASE_SPREAD = 3.2;       // ~735u apart at 1.0 -> ~2350u apart at 3.2
-// A pod dropped in space auto-returns home after this many seconds untouched, so a match can't
-// stall with a pod lost in the void nobody reclaims.
-const CARGO_DROP_TIMEOUT = 25;     // seconds a loose pod floats before auto-returning home
+// A pod dropped in space auto-returns to CENTER after this many seconds untouched, so a match can't
+// stall with the flag lost in the void nobody reclaims.
+const CARGO_DROP_TIMEOUT = 25;     // seconds a loose pod floats before auto-returning to center
+// Solid-capital collision: ships cannot fly THROUGH a base. Any ship whose center comes within this
+// radius of a base center is pushed back out to the surface (and its inward velocity killed). Sized
+// to roughly the capital's shield-dome envelope on the client (CL*0.62 with CL~130 -> ~80u), padded
+// a little so the hull reads as solid.
+const BASE_COLLIDE_RADIUS = 90;    // units — ships are shoved out of a base within this range
+const BASE_COLLIDE_PUSH = 2;       // extra separation (units) so a ship doesn't graze back in
 
 // Team spawn anchors: blue spawns on one side of the arena, red on the other. The anchors sit on
 // OPPOSITE diagonal corners, so the old "face ±Z" scheme aimed each ship straight down its own
@@ -372,14 +382,10 @@ export class ArenaRoom extends Room {
     return { x: sp.pos[0] * k, y: sp.pos[1] * k, z: sp.pos[2] * k };
   }
 
-  // A team's cargo pod HOME rest position: a bit in front of its base, toward the arena origin, so
-  // an enemy has a reachable pod to grab rather than one buried inside the base geometry.
-  cargoHome(team) {
-    const b = this.baseCenter(team);
-    const len = Math.sqrt(b.x * b.x + b.y * b.y + b.z * b.z) || 1;
-    // Unit vector from the base toward origin; the pod floats CARGO_HOME_OFFSET along it.
-    const ux = -b.x / len, uy = -b.y / len, uz = -b.z / len;
-    return { x: b.x + ux * CARGO_HOME_OFFSET, y: b.y + uy * CARGO_HOME_OFFSET, z: b.z + uz * CARGO_HOME_OFFSET };
+  // The SINGLE neutral pod's HOME rest position: the arena CENTER (origin), the exact midpoint
+  // between the two bases, so both teams have an equal run for it.
+  cargoHome() {
+    return { x: 0, y: 0, z: 0 };
   }
 
   onJoin(client, options) {
@@ -616,6 +622,9 @@ export class ArenaRoom extends Room {
     // --- 1b) Ship-to-ship hull collisions -----------------------------------------------------
     this.resolveShipCollisions();
 
+    // --- 1c) Capital-base collisions (CTC only): bases are SOLID, ships can't fly through them --
+    if (this.isCTC()) this.resolveBaseCollisions();
+
     // --- 2) Bolts: advance and hit-detect -----------------------------------------------------
     this.advanceBolts();
 
@@ -692,6 +701,39 @@ export class ArenaRoom extends Room {
     if (this._collideCd.size > 256) {
       for (const [key, t] of this._collideCd) {
         if (this._now >= t) this._collideCd.delete(key);
+      }
+    }
+  }
+
+  // Authoritative SOLID-CAPITAL collision (CTC): the two team bases are impassable. Any LIVE ship
+  // whose center penetrates a base's BASE_COLLIDE_RADIUS is shoved back out to the surface along the
+  // base->ship normal, and its inward velocity component is cancelled so it doesn't tunnel back in.
+  // Purely positional (no damage) — a base is a wall, not a weapon. Mirrors the client's local
+  // base-collision so prediction and server truth agree.
+  resolveBaseCollisions() {
+    const bases = [this.baseCenter(0), this.baseCenter(1)];
+    const r = BASE_COLLIDE_RADIUS, r2 = r * r;
+    for (const [sid, ship] of this.state.ships) {
+      if (!ship.alive) continue;
+      const s = this.sim.get(sid);
+      if (!s) continue;
+      for (const b of bases) {
+        let dx = s.pos.x - b.x, dy = s.pos.y - b.y, dz = s.pos.z - b.z;
+        const d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 >= r2) continue;   // outside the hull envelope
+        let dist = Math.sqrt(d2);
+        // Degenerate exact-center case: shove straight up along +Y so we never divide by zero.
+        if (dist < 1e-4) { dx = 0; dy = 1; dz = 0; dist = 1e-4; }
+        const nx = dx / dist, ny = dy / dist, nz = dz / dist;
+        // Push out to the surface plus a small pad.
+        const push = (r - dist) + BASE_COLLIDE_PUSH;
+        s.pos.x += nx * push; s.pos.y += ny * push; s.pos.z += nz * push;
+        // Kill the inward (toward-base) velocity component so the ship slides along the hull.
+        const vn = s.vel.x * nx + s.vel.y * ny + s.vel.z * nz;
+        if (vn < 0) { s.vel.x -= nx * vn; s.vel.y -= ny * vn; s.vel.z -= nz * vn; }
+        // Reflect the corrected pose back onto the replicated schema this tick.
+        ship.px = s.pos.x; ship.py = s.pos.y; ship.pz = s.pos.z;
+        ship.vx = s.vel.x; ship.vy = s.vel.y; ship.vz = s.vel.z;
       }
     }
   }
@@ -878,25 +920,24 @@ export class ArenaRoom extends Room {
 
   // ---- Capture the Cargo -----------------------------------------------------------------------
 
-  // Create both team pods at their home rest positions. Called once when a CTC match starts.
+  // Create the SINGLE neutral cargo pod at the arena center. Called once when a CTC match starts.
+  // The GLB variant is RANDOMIZED across all container models each round for visual variety.
   setupCargo() {
     this.clearCargo();
-    for (let team = 0; team <= 1; team++) {
-      const pod = new Cargo();
-      pod.team = team;
-      pod.modelIndex = team;   // stable per-pod GLB variant (blue = 0, red = 1)
-      this.resetCargoHome(pod);
-      this.state.cargo.set(String(team), pod);
-    }
+    const pod = new Cargo();
+    pod.team = CARGO_TEAM_NEUTRAL;   // neutral — contested by both teams
+    pod.modelIndex = Math.floor(Math.random() * CARGO_MODEL_COUNT);   // random container GLB this round
+    this.resetCargoHome(pod);
+    this.state.cargo.set('flag', pod);
   }
 
   clearCargo() {
     for (const key of [...this.state.cargo.keys()]) this.state.cargo.delete(key);
   }
 
-  // Park a pod at its owning team's home rest position (loose flags cleared).
+  // Park the pod at CENTER (loose/carry flags cleared).
   resetCargoHome(pod) {
-    const h = this.cargoHome(pod.team);
+    const h = this.cargoHome();
     pod.px = h.x; pod.py = h.y; pod.pz = h.z;
     pod.carrier = '';
     pod.atHome = true;
@@ -917,10 +958,11 @@ export class ArenaRoom extends Room {
     });
   }
 
-  // One CTC tick: for each pod, either track its carrier, resolve a capture at the carrier's base,
-  // handle owning-team returns / enemy pickups of a loose or home pod, or auto-return a stale drop.
-  // Also flips a capture-win the moment a team reaches the capture target. Called only when the
-  // match is LIVE and the mode is CTC.
+  // One CTC tick for the SINGLE neutral pod: track its carrier and score a capture the moment the
+  // carrier reaches within CARGO_CAPTURE_RADIUS of THEIR OWN base; otherwise let the closest pilot of
+  // EITHER team within pickup range grab a loose/center pod, or auto-return a stale drop to center.
+  // Flips a capture-win the moment a team reaches the capture target. Called only when the match is
+  // LIVE and the mode is CTC.
   advanceCargo() {
     this.state.cargo.forEach((pod) => {
       // --- Carried: ride the carrier and check for a capture at the carrier's own base ----------
@@ -935,34 +977,29 @@ export class ArenaRoom extends Room {
         // Track the carrier's position (slung just under the hull, done visually on the client).
         pod.px = cs.pos.x; pod.py = cs.pos.y; pod.pz = cs.pos.z;
         pod.atHome = false;
-        // Capture check: the carrier (an ENEMY of pod.team) reaching THEIR OWN base scores.
+        // Capture check: the carrier hugging within 19u of THEIR OWN base's solid hull surface
+        // scores. Measured from center as (solid radius + 19u margin), since a ship can't pass
+        // through the base itself (BASE_COLLIDE_RADIUS).
         const homeBase = this.baseCenter(carrier.team);
+        const capR = BASE_COLLIDE_RADIUS + CARGO_CAPTURE_SURFACE_MARGIN;
         const dx = cs.pos.x - homeBase.x, dy = cs.pos.y - homeBase.y, dz = cs.pos.z - homeBase.z;
-        if (dx * dx + dy * dy + dz * dz <= CARGO_CAPTURE_RADIUS * CARGO_CAPTURE_RADIUS) {
+        if (dx * dx + dy * dy + dz * dz <= capR * capR) {
           this.scoreCapture(carrier, pod);
         }
         return;
       }
 
-      // --- Loose or home pod: pickups / returns / auto-return -----------------------------------
+      // --- Loose or center pod: the closest pilot of EITHER team within pickup range grabs it -----
       let claimedBy = null, nearestPickup = CARGO_PICKUP_RADIUS * CARGO_PICKUP_RADIUS;
-      let returnedHome = false;
       this.state.ships.forEach((ship, sid) => {
-        if (!ship.alive) return;
+        if (!ship.alive || ship.carrying) return;
         const s = this.sim.get(sid);
         if (!s) return;
         const dx = s.pos.x - pod.px, dy = s.pos.y - pod.py, dz = s.pos.z - pod.pz;
         const d2 = dx * dx + dy * dy + dz * dz;
-        if (ship.team === pod.team) {
-          // Owning-team pilot touching a DROPPED pod returns it home instantly (a home pod is a no-op).
-          if (!pod.atHome && d2 <= CARGO_RETURN_RADIUS * CARGO_RETURN_RADIUS) returnedHome = true;
-        } else {
-          // Enemy pilot: closest one within pickup range grabs it (only one pod per pilot).
-          if (!ship.carrying && d2 <= nearestPickup) { nearestPickup = d2; claimedBy = sid; }
-        }
+        if (d2 <= nearestPickup) { nearestPickup = d2; claimedBy = sid; }
       });
 
-      if (returnedHome) { this.resetCargoHome(pod); return; }
       if (claimedBy) {
         const grabber = this.state.ships.get(claimedBy);
         if (grabber) grabber.carrying = true;
@@ -970,7 +1007,7 @@ export class ArenaRoom extends Room {
         pod.atHome = false;
         return;
       }
-      // Auto-return a stale loose pod so a lost flag can't stall the match.
+      // Auto-return a stale loose pod to center so a lost flag can't stall the match.
       if (!pod.atHome && pod._dropAt && this._now >= pod._dropAt) this.resetCargoHome(pod);
     });
   }

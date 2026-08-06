@@ -96,21 +96,21 @@ defineTypes(Ship, {
   carrying: 'boolean',
 });
 
-// ---- Capture the Cargo: one team's cargo pod (the "flag") --------------------------------------
-// There are exactly two of these in CTC mode (blue's and red's), keyed by team in ArenaState.cargo.
-// A pod starts "at home" next to its owning team's capital base. An ENEMY pilot who flies close
-// enough picks it up (carrier set); while carried it rides on the carrier and streams that pilot's
-// position. If the carrier is killed or leaves, the pod DROPS and floats in space until reclaimed
-// by another enemy pilot or touched by an owning-team pilot (which returns it home). An enemy who
-// carries it back to their own base scores a capture and the pod resets home.
+// ---- Capture the Cargo: the SINGLE neutral cargo pod (the "flag") ------------------------------
+// There is exactly ONE of these in CTC mode, keyed 'flag' in ArenaState.cargo, spawned dead-center
+// between the two capital bases. It is NEUTRAL (team = 2): EITHER team can grab it. It starts "at
+// home" at the arena center; a pilot who flies close enough picks it up (carrier set); while carried
+// it rides on the carrier and streams that pilot's position. If the carrier is killed or leaves, the
+// pod DROPS and floats in space until reclaimed by any pilot, or auto-returns to center after a
+// timeout. A carrier who hauls it to their OWN base scores a capture and the pod resets to center.
 export class Cargo extends Schema {
   constructor() {
     super();
-    this.team = 0;            // owning team (0 = blue's pod, 1 = red's pod)
-    this.px = 0; this.py = 0; this.pz = 0;   // world position (home, dropped, or carrier-tracked)
-    this.carrier = '';        // sessionId of the enemy pilot carrying it ('' = loose or at home)
-    this.atHome = true;       // true when resting at its home base (not carried, not dropped adrift)
-    this.modelIndex = 0;      // which container GLB variant to render (stable per pod)
+    this.team = 2;            // 2 = NEUTRAL (contested by both teams); the single flag has no owner
+    this.px = 0; this.py = 0; this.pz = 0;   // world position (center home, dropped, or carrier-tracked)
+    this.carrier = '';        // sessionId of the pilot carrying it ('' = loose or at center)
+    this.atHome = true;       // true when resting at center (not carried, not dropped adrift)
+    this.modelIndex = 0;      // which container GLB variant to render (randomized each round)
   }
 }
 defineTypes(Cargo, {
@@ -170,8 +170,8 @@ export class ArenaState extends Schema {
     this.ships = new MapSchema();
     this.bolts = new MapSchema();
     this.missiles = new MapSchema();
-    // Capture the Cargo pods, keyed by owning team: cargo.get('0') = blue's pod, cargo.get('1') =
-    // red's. Populated only when a CTC match starts; empty otherwise so SDM/FFA replicate nothing.
+    // Capture the Cargo: the single neutral flag, keyed 'flag' (cargo.get('flag')). Populated only
+    // when a CTC match starts; empty otherwise so SDM/FFA replicate nothing.
     this.cargo = new MapSchema();
     this.blueCount = 0;
     this.redCount = 0;
