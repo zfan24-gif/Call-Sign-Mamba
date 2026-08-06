@@ -9,7 +9,7 @@
 // leave. Shooting, damage, death/respawn, scoring, and win conditions are Phase 2+ and are called
 // out with TODO markers where they'll slot in.
 import { Room } from '@colyseus/core';
-import { ArenaState, Ship, Bolt, Missile } from './schema.js';
+import { ArenaState, Ship, Bolt, Missile, Cargo } from './schema.js';
 import { stepShip, forwardFromQuat, yawQuatToward } from '../shared/flightModel.js';
 import { sanitizeShip, statsFor } from './shipStats.js';
 
@@ -108,6 +108,23 @@ function missileTurnForRange(dist) {
 // negative) and the match ends the tick it reaches 0.
 const ROUND_DURATIONS = [300, 600, 900, 1200];   // 5 / 10 / 15 / 20 minutes (seconds)
 const DEFAULT_ROUND = 600;                        // 10 minutes
+
+// --- Capture the Cargo settings ----------------------------------------------------------------
+// A capture-the-flag mode: each team owns a cargo pod parked at its capital base. An ENEMY pilot
+// flies in, picks it up, and hauls it back to THEIR base to score. Match plays to a capture target
+// (host picks 4 / 7 / 10 in the lobby), or most captures when the round clock runs out.
+const CAPTURE_TARGETS = [4, 7, 10];               // host-selectable captures-to-win whitelist
+const DEFAULT_CAPTURE_TARGET = 7;
+// The two capital "home bases" — reuse the team spawn anchors so a team defends where it spawns.
+// A pod rests a little in front of its base (toward the enemy anchor) so it's reachable, and a
+// capture completes when an enemy carrier gets within CARGO_CAPTURE_RADIUS of THEIR OWN base.
+const CARGO_PICKUP_RADIUS = 22;    // units — an enemy this close to a loose/home pod grabs it
+const CARGO_RETURN_RADIUS = 22;    // units — an owning-team pilot this close to a DROPPED pod returns it home
+const CARGO_CAPTURE_RADIUS = 60;   // units — a carrier this close to their own base scores a capture
+const CARGO_HOME_OFFSET = 40;      // units the resting pod sits in front of its base (toward the arena)
+// A pod dropped in space auto-returns home after this many seconds untouched, so a match can't
+// stall with a pod lost in the void nobody reclaims.
+const CARGO_DROP_TIMEOUT = 25;     // seconds a loose pod floats before auto-returning home
 
 // Team spawn anchors: blue spawns on one side of the arena, red on the other. The anchors sit on
 // OPPOSITE diagonal corners, so the old "face ±Z" scheme aimed each ship straight down its own
@@ -229,6 +246,9 @@ export class ArenaRoom extends Room {
     this.state.timeLeft = DEFAULT_ROUND;
     this.state.blueKills = 0;
     this.state.redKills = 0;
+    this.state.blueCaptures = 0;
+    this.state.redCaptures = 0;
+    this.state.captureTarget = DEFAULT_CAPTURE_TARGET;
     this.state.winningTeam = -1;
 
     // HOST-ONLY lobby config: change the game mode / round settings before the match starts. Only
@@ -238,13 +258,17 @@ export class ArenaRoom extends Room {
       if (client.sessionId !== this.state.host) return;      // only the host configures
       if (this.state.matchState !== 'lobby') return;          // no reconfiguring a live/ended round
       if (!msg) return;
-      // Whitelist the mode: Squadron Death Match (teams) or Free-For-All (every-man-for-himself).
-      if (msg.mode === 'sdm' || msg.mode === 'ffa') this.state.mode = msg.mode;
+      // Whitelist the mode: Squadron Death Match (teams), Free-For-All (every-man-for-himself), or
+      // Capture the Cargo (team capture-the-flag). Anything else is ignored.
+      if (msg.mode === 'sdm' || msg.mode === 'ffa' || msg.mode === 'ctc') this.state.mode = msg.mode;
       const d = Number(msg.roundDuration);
       if (ROUND_DURATIONS.includes(d)) {
         this.state.roundDuration = d;
         this.state.timeLeft = d;   // keep the displayed lobby clock in sync with the chosen length
       }
+      // Capture the Cargo: captures-to-win target (only 4 / 7 / 10 accepted).
+      const ct = Number(msg.captureTarget);
+      if (CAPTURE_TARGETS.includes(ct)) this.state.captureTarget = ct;
     });
 
     // A client picks/changes their hull (during the ship-select window at match start). We validate
@@ -330,6 +354,26 @@ export class ArenaRoom extends Room {
   // gate the team-only behaviors: team ship-roster filtering, friendly-fire exemption, team spawn
   // anchors, and team-vs-team scoring all switch off in FFA.
   isFFA() { return this.state.mode === 'ffa'; }
+
+  // True while this room is running Capture the Cargo (team capture-the-flag). Gates all cargo
+  // pickup/carry/capture logic and the capture-based win condition.
+  isCTC() { return this.state.mode === 'ctc'; }
+
+  // The world-space capital base center for a team (its spawn anchor).
+  baseCenter(team) {
+    const sp = SPAWN[team] || SPAWN[0];
+    return { x: sp.pos[0], y: sp.pos[1], z: sp.pos[2] };
+  }
+
+  // A team's cargo pod HOME rest position: a bit in front of its base, toward the arena origin, so
+  // an enemy has a reachable pod to grab rather than one buried inside the base geometry.
+  cargoHome(team) {
+    const b = this.baseCenter(team);
+    const len = Math.sqrt(b.x * b.x + b.y * b.y + b.z * b.z) || 1;
+    // Unit vector from the base toward origin; the pod floats CARGO_HOME_OFFSET along it.
+    const ux = -b.x / len, uy = -b.y / len, uz = -b.z / len;
+    return { x: b.x + ux * CARGO_HOME_OFFSET, y: b.y + uy * CARGO_HOME_OFFSET, z: b.z + uz * CARGO_HOME_OFFSET };
+  }
 
   onJoin(client, options) {
     const ffa = this.isFFA();
@@ -427,6 +471,9 @@ export class ArenaRoom extends Room {
   removeShip(sessionId) {
     const ship = this.state.ships.get(sessionId);
     if (!ship) { this.sim.delete(sessionId); return; }
+    // Capture the Cargo: if this pilot was carrying a pod, drop it loose at their last position so a
+    // rage-quit/disconnect can't carry the flag out of the match — the fight for it continues.
+    if (this.isCTC() && ship.carrying) this.dropCargoFrom(sessionId, ship.px, ship.py, ship.pz);
     if (ship.team === 0) this.state.blueCount = Math.max(0, this.state.blueCount - 1);
     else this.state.redCount = Math.max(0, this.state.redCount - 1);
     this.state.ships.delete(sessionId);
@@ -567,6 +614,9 @@ export class ArenaRoom extends Room {
 
     // --- 3) Missiles: home toward their locked target, advance, and proximity-fuse -------------
     this.advanceMissiles();
+
+    // --- 4) Capture the Cargo: pickups, carrier tracking, returns, and captures ---------------
+    if (this.state.matchState === 'live' && this.isCTC()) this.advanceCargo();
   }
 
   // Authoritative ship-to-ship hull collisions. All-pairs sweep over LIVE ships (fine at 24 players):
@@ -819,6 +869,131 @@ export class ArenaRoom extends Room {
     }
   }
 
+  // ---- Capture the Cargo -----------------------------------------------------------------------
+
+  // Create both team pods at their home rest positions. Called once when a CTC match starts.
+  setupCargo() {
+    this.clearCargo();
+    for (let team = 0; team <= 1; team++) {
+      const pod = new Cargo();
+      pod.team = team;
+      pod.modelIndex = team;   // stable per-pod GLB variant (blue = 0, red = 1)
+      this.resetCargoHome(pod);
+      this.state.cargo.set(String(team), pod);
+    }
+  }
+
+  clearCargo() {
+    for (const key of [...this.state.cargo.keys()]) this.state.cargo.delete(key);
+  }
+
+  // Park a pod at its owning team's home rest position (loose flags cleared).
+  resetCargoHome(pod) {
+    const h = this.cargoHome(pod.team);
+    pod.px = h.x; pod.py = h.y; pod.pz = h.z;
+    pod.carrier = '';
+    pod.atHome = true;
+    pod._dropAt = 0;   // server-only: sim time a loose pod auto-returns (unused while home/carried)
+  }
+
+  // Drop whatever pod `sessionId` is carrying (on death or leave): the pod goes loose in space at
+  // the pilot's last position and starts its auto-return countdown. Clears the pilot's carry flag.
+  dropCargoFrom(sessionId, atX, atY, atZ) {
+    const ship = this.state.ships.get(sessionId);
+    if (ship) ship.carrying = false;
+    this.state.cargo.forEach((pod) => {
+      if (pod.carrier !== sessionId) return;
+      pod.carrier = '';
+      pod.atHome = false;
+      if (typeof atX === 'number') { pod.px = atX; pod.py = atY; pod.pz = atZ; }
+      pod._dropAt = this._now + CARGO_DROP_TIMEOUT;
+    });
+  }
+
+  // One CTC tick: for each pod, either track its carrier, resolve a capture at the carrier's base,
+  // handle owning-team returns / enemy pickups of a loose or home pod, or auto-return a stale drop.
+  // Also flips a capture-win the moment a team reaches the capture target. Called only when the
+  // match is LIVE and the mode is CTC.
+  advanceCargo() {
+    this.state.cargo.forEach((pod) => {
+      // --- Carried: ride the carrier and check for a capture at the carrier's own base ----------
+      if (pod.carrier) {
+        const carrier = this.state.ships.get(pod.carrier);
+        const cs = this.sim.get(pod.carrier);
+        if (!carrier || !carrier.alive || !cs) {
+          // Carrier vanished without a clean drop (edge case) — drop at last known pod position.
+          this.dropCargoFrom(pod.carrier, pod.px, pod.py, pod.pz);
+          return;
+        }
+        // Track the carrier's position (slung just under the hull, done visually on the client).
+        pod.px = cs.pos.x; pod.py = cs.pos.y; pod.pz = cs.pos.z;
+        pod.atHome = false;
+        // Capture check: the carrier (an ENEMY of pod.team) reaching THEIR OWN base scores.
+        const homeBase = this.baseCenter(carrier.team);
+        const dx = cs.pos.x - homeBase.x, dy = cs.pos.y - homeBase.y, dz = cs.pos.z - homeBase.z;
+        if (dx * dx + dy * dy + dz * dz <= CARGO_CAPTURE_RADIUS * CARGO_CAPTURE_RADIUS) {
+          this.scoreCapture(carrier, pod);
+        }
+        return;
+      }
+
+      // --- Loose or home pod: pickups / returns / auto-return -----------------------------------
+      let claimedBy = null, nearestPickup = CARGO_PICKUP_RADIUS * CARGO_PICKUP_RADIUS;
+      let returnedHome = false;
+      this.state.ships.forEach((ship, sid) => {
+        if (!ship.alive) return;
+        const s = this.sim.get(sid);
+        if (!s) return;
+        const dx = s.pos.x - pod.px, dy = s.pos.y - pod.py, dz = s.pos.z - pod.pz;
+        const d2 = dx * dx + dy * dy + dz * dz;
+        if (ship.team === pod.team) {
+          // Owning-team pilot touching a DROPPED pod returns it home instantly (a home pod is a no-op).
+          if (!pod.atHome && d2 <= CARGO_RETURN_RADIUS * CARGO_RETURN_RADIUS) returnedHome = true;
+        } else {
+          // Enemy pilot: closest one within pickup range grabs it (only one pod per pilot).
+          if (!ship.carrying && d2 <= nearestPickup) { nearestPickup = d2; claimedBy = sid; }
+        }
+      });
+
+      if (returnedHome) { this.resetCargoHome(pod); return; }
+      if (claimedBy) {
+        const grabber = this.state.ships.get(claimedBy);
+        if (grabber) grabber.carrying = true;
+        pod.carrier = claimedBy;
+        pod.atHome = false;
+        return;
+      }
+      // Auto-return a stale loose pod so a lost flag can't stall the match.
+      if (!pod.atHome && pod._dropAt && this._now >= pod._dropAt) this.resetCargoHome(pod);
+    });
+  }
+
+  // Award a capture to the carrier's team, reset the pod home, and end the match if the team has
+  // reached the capture target. Broadcasts a 'capture' event for client feedback (banner + SFX).
+  scoreCapture(carrier, pod) {
+    const team = carrier.team;
+    if (team === 0) this.state.blueCaptures = (this.state.blueCaptures + 1) & 0xffff;
+    else this.state.redCaptures = (this.state.redCaptures + 1) & 0xffff;
+    carrier.carrying = false;
+    this.resetCargoHome(pod);
+    this.broadcast('capture', {
+      team,
+      carrier: this.sessionIdOf(carrier),
+      carrierName: carrier.name,
+      podTeam: pod.team,
+      blueCaptures: this.state.blueCaptures,
+      redCaptures: this.state.redCaptures,
+    });
+    const scored = team === 0 ? this.state.blueCaptures : this.state.redCaptures;
+    if (scored >= this.state.captureTarget) this.endMatch();
+  }
+
+  // Resolve a ship object back to its sessionId (small reverse lookup; CTC events only).
+  sessionIdOf(shipObj) {
+    for (const [sid, ship] of this.state.ships) if (ship === shipObj) return sid;
+    return '';
+  }
+
   // Apply damage to a ship: shields absorb first, then hull. Credits a kill on destruction.
   // Broadcasts a 'hit' event so BOTH the shooter (hit-marker "you connected") and the victim
   // (damage flash / "you're taking fire") get immediate feedback, independent of the kill event.
@@ -849,6 +1024,9 @@ export class ArenaRoom extends Room {
     ship.hull = 0;
     ship.shields = 0;
     ship.speaking = false;   // a destroyed pilot drops off the radio until they respawn
+    // Capture the Cargo: a destroyed carrier DROPS the pod where they died — killing the flag runner
+    // is the primary way to stop a capture, so the pod goes loose right there for the fight over it.
+    if (this.isCTC() && ship.carrying) this.dropCargoFrom(sid, ship.px, ship.py, ship.pz);
     ship.deaths = (ship.deaths + 1) & 0xffff;
     ship.respawnIn = RESPAWN_DELAY;                          // seed the replicated countdown immediately
     ship.lastKiller = (attackerId && attackerId !== sid) ? attackerId : '';   // for the client kill-cam framing
@@ -1058,6 +1236,8 @@ export class ArenaRoom extends Room {
     this.state.timeLeft = this.state.roundDuration;
     this.state.blueKills = 0;
     this.state.redKills = 0;
+    this.state.blueCaptures = 0;
+    this.state.redCaptures = 0;
     this.state.winningTeam = -1;
     // Clear any prior FFA result so a fresh round starts with no winner shown.
     this.state.winnerId = '';
@@ -1069,10 +1249,18 @@ export class ArenaRoom extends Room {
       ship.kills = 0;
       ship.deaths = 0;
       ship.ready = false;
+      ship.carrying = false;   // no one starts a round holding cargo
       const s = this.sim.get(sid);
       if (s) this.respawnShip(sid, ship, s);
     }
-    this.broadcast('matchStart', { roundDuration: this.state.roundDuration, mode: this.state.mode });
+    // Capture the Cargo: spawn both team pods at home. Other modes clear any stale pods so nothing
+    // renders (SDM/FFA have no cargo).
+    if (this.isCTC()) this.setupCargo(); else this.clearCargo();
+    this.broadcast('matchStart', {
+      roundDuration: this.state.roundDuration,
+      mode: this.state.mode,
+      captureTarget: this.state.captureTarget,
+    });
     console.log(`[arena] MATCH START — mode=${this.state.mode}, round=${this.state.roundDuration}s [roomId=${this.roomId}]`);
   }
 
@@ -1102,6 +1290,22 @@ export class ArenaRoom extends Room {
         winnerId: topId, winnerName: topName, winnerKills: topKills,
       });
       console.log(`[arena] FFA MATCH END — winner=${topName || 'DRAW'} (${topKills} kills) [roomId=${this.roomId}]`);
+      return;
+    }
+
+    if (this.isCTC()) {
+      // Capture the Cargo: the team with more captures wins (either by hitting the target early —
+      // scoreCapture calls endMatch — or by leading when the clock runs out). Equal captures = draw.
+      const bc = this.state.blueCaptures, rc = this.state.redCaptures;
+      this.state.winningTeam = bc > rc ? 0 : rc > bc ? 1 : -1;
+      this.clearCargo();   // pull the pods once the round is decided
+      this.broadcast('matchEnd', {
+        mode: 'ctc',
+        winningTeam: this.state.winningTeam,
+        blueCaptures: bc, redCaptures: rc,
+        captureTarget: this.state.captureTarget,
+      });
+      console.log(`[arena] CTC MATCH END — BLUE ${bc} : ${rc} RED -> winner=${this.state.winningTeam === -1 ? 'DRAW' : this.state.winningTeam === 0 ? 'BLUE' : 'RED'} [roomId=${this.roomId}]`);
       return;
     }
 

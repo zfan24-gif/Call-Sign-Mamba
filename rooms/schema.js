@@ -7,6 +7,7 @@
 // We use the `defineTypes()` form (rather than TypeScript `@type` decorators) so this runs as plain
 // ESM Node with no build step.
 import { Schema, MapSchema, defineTypes } from '@colyseus/schema';
+// (Cargo is declared below and referenced in ArenaState's cargo map.)
 
 // One networked ship. `lastSeq` is the input frame number the server has applied for this player;
 // the owning client uses it to discard already-acknowledged inputs and re-simulate the rest on top
@@ -60,6 +61,11 @@ export class Ship extends Schema {
     // the room is ready. Replicated so every lobby shows each pilot's ready pip live. Reset to false
     // on join and after a match ends (back to the lobby), so a fresh ready-check runs each round.
     this.ready = false;
+    // --- Capture the Cargo ---
+    // True while THIS pilot is carrying an enemy cargo pod (the "flag"). Replicated so every client
+    // can render the carried pod slung under the hull AND so the HUD emphasizes a carrier's targeting
+    // brackets (a big deal: shoot the carrier down and the cargo drops). Only meaningful in CTC mode.
+    this.carrying = false;
   }
 }
 defineTypes(Ship, {
@@ -87,6 +93,32 @@ defineTypes(Ship, {
   rankScore: 'uint32',
   pioneer: 'boolean',
   ready: 'boolean',
+  carrying: 'boolean',
+});
+
+// ---- Capture the Cargo: one team's cargo pod (the "flag") --------------------------------------
+// There are exactly two of these in CTC mode (blue's and red's), keyed by team in ArenaState.cargo.
+// A pod starts "at home" next to its owning team's capital base. An ENEMY pilot who flies close
+// enough picks it up (carrier set); while carried it rides on the carrier and streams that pilot's
+// position. If the carrier is killed or leaves, the pod DROPS and floats in space until reclaimed
+// by another enemy pilot or touched by an owning-team pilot (which returns it home). An enemy who
+// carries it back to their own base scores a capture and the pod resets home.
+export class Cargo extends Schema {
+  constructor() {
+    super();
+    this.team = 0;            // owning team (0 = blue's pod, 1 = red's pod)
+    this.px = 0; this.py = 0; this.pz = 0;   // world position (home, dropped, or carrier-tracked)
+    this.carrier = '';        // sessionId of the enemy pilot carrying it ('' = loose or at home)
+    this.atHome = true;       // true when resting at its home base (not carried, not dropped adrift)
+    this.modelIndex = 0;      // which container GLB variant to render (stable per pod)
+  }
+}
+defineTypes(Cargo, {
+  team: 'uint8',
+  px: 'float32', py: 'float32', pz: 'float32',
+  carrier: 'string',
+  atHome: 'boolean',
+  modelIndex: 'uint8',
 });
 
 // One networked laser bolt. Spawned authoritatively when a client sends a valid 'fire' intent, then
@@ -138,6 +170,9 @@ export class ArenaState extends Schema {
     this.ships = new MapSchema();
     this.bolts = new MapSchema();
     this.missiles = new MapSchema();
+    // Capture the Cargo pods, keyed by owning team: cargo.get('0') = blue's pod, cargo.get('1') =
+    // red's. Populated only when a CTC match starts; empty otherwise so SDM/FFA replicate nothing.
+    this.cargo = new MapSchema();
     this.blueCount = 0;
     this.redCount = 0;
     // --- Match / game-mode state (host-configured in the lobby, server-authoritative) ---
@@ -147,6 +182,12 @@ export class ArenaState extends Schema {
     this.timeLeft = 600;         // seconds remaining in the live round; counts down to 0 and stops (never negative)
     this.blueKills = 0;          // total enemy kills scored BY blue team this round (win metric)
     this.redKills = 0;           // total enemy kills scored BY red team this round
+    // --- Capture the Cargo score (only meaningful when mode === 'ctc') ---
+    // A capture = an enemy pilot carrying the OTHER team's pod back to their own base. First team to
+    // captureTarget captures wins immediately (or most captures when the clock runs out).
+    this.blueCaptures = 0;       // captures scored BY blue team this round
+    this.redCaptures = 0;        // captures scored BY red team this round
+    this.captureTarget = 7;      // captures needed to win (host picks 4 / 7 / 10 in the lobby)
     this.winningTeam = -1;       // -1 = undecided / draw; 0 = blue won; 1 = red won (set when matchState -> 'ended')
     this.host = '';              // sessionId of the lobby host (the pilot who may set config + start the match)
     // --- Free-For-All result (only meaningful when mode === 'ffa') ---
@@ -161,6 +202,7 @@ defineTypes(ArenaState, {
   ships: { map: Ship },
   bolts: { map: Bolt },
   missiles: { map: Missile },
+  cargo: { map: Cargo },
   blueCount: 'uint8',
   redCount: 'uint8',
   mode: 'string',
@@ -169,6 +211,9 @@ defineTypes(ArenaState, {
   timeLeft: 'float32',
   blueKills: 'uint16',
   redKills: 'uint16',
+  blueCaptures: 'uint16',
+  redCaptures: 'uint16',
+  captureTarget: 'uint16',
   winningTeam: 'int8',
   host: 'string',
   winnerId: 'string',
