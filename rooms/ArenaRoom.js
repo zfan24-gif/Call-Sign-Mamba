@@ -134,11 +134,18 @@ const CTC_BASE_SPREAD = 3.2;       // ~735u apart at 1.0 -> ~2350u apart at 3.2
 // stall with the flag lost in the void nobody reclaims.
 const CARGO_DROP_TIMEOUT = 25;     // seconds a loose pod floats before auto-returning to center
 // Solid-capital collision: ships cannot fly THROUGH a base. Any ship whose center comes within this
-// radius of a base center is pushed back out to the surface (and its inward velocity killed). Sized
-// to roughly the capital's shield-dome envelope on the client (CL*0.62 with CL~130 -> ~80u), padded
-// a little so the hull reads as solid.
-const BASE_COLLIDE_RADIUS = 90;    // units — ships are shoved out of a base within this range
+// radius of a base center is pushed back out to the surface (and its inward velocity killed).
+// PER-TEAM sizes: the two capitals are DIFFERENT hulls with very different lengths — the blue
+// flagship normalizes to ~140u long (half-length ~70), the red capital to ~260u long (half-length
+// ~130). A single 90u sphere fits blue but is buried deep inside the much longer red hull, which
+// made red-side collision AND cargo capture feel like the return point was on the far side of the
+// ship. Sizing each sphere to its own hull (roughly half the long axis, padded) fixes both. MUST
+// stay in sync with the client's CTC_BASE_COLLIDE_R map.
+const BASE_COLLIDE_RADIUS_TEAM = { 0: 90, 1: 150 };   // 0 = blue flagship, 1 = red capital
+const BASE_COLLIDE_RADIUS = 90;    // legacy fallback (unused once per-team lookups are wired)
 const BASE_COLLIDE_PUSH = 2;       // extra separation (units) so a ship doesn't graze back in
+// Per-team helper: the solid collision radius for a given base team.
+function baseCollideRadius(team) { return BASE_COLLIDE_RADIUS_TEAM[team] != null ? BASE_COLLIDE_RADIUS_TEAM[team] : BASE_COLLIDE_RADIUS; }
 
 // Team spawn anchors: blue spawns on one side of the arena, red on the other. The anchors sit on
 // OPPOSITE diagonal corners, so the old "face ±Z" scheme aimed each ship straight down its own
@@ -711,13 +718,17 @@ export class ArenaRoom extends Room {
   // Purely positional (no damage) — a base is a wall, not a weapon. Mirrors the client's local
   // base-collision so prediction and server truth agree.
   resolveBaseCollisions() {
-    const bases = [this.baseCenter(0), this.baseCenter(1)];
-    const r = BASE_COLLIDE_RADIUS, r2 = r * r;
+    // Pair each base center with ITS team's collision radius (blue and red hulls are different sizes).
+    const bases = [
+      { c: this.baseCenter(0), r: baseCollideRadius(0) },
+      { c: this.baseCenter(1), r: baseCollideRadius(1) },
+    ];
     for (const [sid, ship] of this.state.ships) {
       if (!ship.alive) continue;
       const s = this.sim.get(sid);
       if (!s) continue;
-      for (const b of bases) {
+      for (const base of bases) {
+        const b = base.c, r = base.r, r2 = r * r;
         let dx = s.pos.x - b.x, dy = s.pos.y - b.y, dz = s.pos.z - b.z;
         const d2 = dx * dx + dy * dy + dz * dz;
         if (d2 >= r2) continue;   // outside the hull envelope
@@ -981,7 +992,10 @@ export class ArenaRoom extends Room {
         // scores. Measured from center as (solid radius + 19u margin), since a ship can't pass
         // through the base itself (BASE_COLLIDE_RADIUS).
         const homeBase = this.baseCenter(carrier.team);
-        const capR = BASE_COLLIDE_RADIUS + CARGO_CAPTURE_SURFACE_MARGIN;
+        // Capture radius is measured from the base CENTER as (that team's solid radius + 19u margin),
+        // so it always sits just outside whichever hull the carrier is returning to — symmetric for
+        // both the small blue flagship and the much larger red capital, from ANY approach direction.
+        const capR = baseCollideRadius(carrier.team) + CARGO_CAPTURE_SURFACE_MARGIN;
         const dx = cs.pos.x - homeBase.x, dy = cs.pos.y - homeBase.y, dz = cs.pos.z - homeBase.z;
         if (dx * dx + dy * dy + dz * dz <= capR * capR) {
           this.scoreCapture(carrier, pod);
