@@ -45,7 +45,8 @@ const BOT_MISSILE_COOLDOWN = 7.5;  // seconds between a bot's missiles (on top o
 const BOT_MISSILE_CHANCE = 0.02;   // low per-tick chance so missiles are an occasional spike
 const BOT_BOOST_RANGE = 520;       // boost to close the gap when the target is beyond this
 const BOT_ENGAGE_RANGE = 1400;     // beyond this a bot regroups toward the objective instead of dogfighting
-const BOT_REACT_JITTER = 0.16;     // steering imperfection so aim isn't robotic/pinpoint
+const BOT_REACT_JITTER = 0.05;     // small steering imperfection so aim isn't robotic (kept low so it
+                                   // adds life without preventing the bot from settling on target)
 const BOT_RETARGET_SEC = 1.1;      // how often a bot re-evaluates its target/intent
 
 export class DemoBots {
@@ -250,24 +251,28 @@ export class DemoBots {
       }
     }
 
-    // 3) Otherwise pursue the tactical target (an enemy to dogfight, or an enemy flag-carrier to gang).
+    // 3) Otherwise pursue the tactical target. We CLOSE on an enemy from any distance (fly straight
+    // toward a far target instead of giving up and circling), but only open FIRE / treat it as a
+    // dogfight once we're inside BOT_ENGAGE_RANGE — beyond that it's just a heading to fly.
     const tid = ai.targetId;
     const tgt = tid && room.state.ships.get(tid);
     if (tgt && tgt.alive) {
       const tp = { x: tgt.px, y: tgt.py, z: tgt.pz };
       const d = this._dist(s.pos, tp);
-      if (d < BOT_ENGAGE_RANGE) {
-        return { x: tp.x, y: tp.y, z: tp.z, dist: d, shoot: tgt.team !== team, targetShip: tgt, targetId: tid };
-      }
+      const inRange = d < BOT_ENGAGE_RANGE;
+      return { x: tp.x, y: tp.y, z: tp.z, dist: d, shoot: inRange && tgt.team !== team, targetShip: inRange ? tgt : null, targetId: inRange ? tid : '' };
     }
 
-    // 4) Nothing pressing -> loosely orbit the flag/center so the action stays near the objective.
+    // 4) Nothing pressing (rare) -> fly a WIDE patrol toward the objective, NOT a tight orbit. A
+    // fighter can't hover, so orbiting a close point made bots corkscrew forever; instead we aim at a
+    // point well AHEAD of the objective, offset by a slow-drifting bearing, so the bot flies long,
+    // gentle S-curves across the arena and naturally re-acquires a target rather than looping in place.
     const c = flag ? { x: flag.px, y: flag.py, z: flag.pz } : { x: 0, y: 0, z: 0 };
-    ai.wanderPhase += dtSafe(0.4);
-    const R = 260;
+    ai.wanderPhase += 0.006;                     // very slow drift (~0.18 rad/s) => long, lazy curves
+    const R = 900;                               // wide lead so the goal stays far ahead, never orbited
     const gx = c.x + Math.cos(ai.wanderPhase) * R;
     const gz = c.z + Math.sin(ai.wanderPhase) * R;
-    const gy = c.y + Math.sin(ai.wanderPhase * 0.5) * 80;
+    const gy = c.y + Math.sin(ai.wanderPhase * 0.5) * 120;
     return { x: gx, y: gy, z: gz, dist: this._dist(s.pos, { x: gx, y: gy, z: gz }), shoot: false, targetShip: null, targetId: '' };
   }
 
@@ -277,27 +282,42 @@ export class DemoBots {
   // sitting duck); reverses only if it badly overshoots straight ahead is unnecessary for the show.
   _steerToward(s, tx, ty, tz, ai) {
     const fwd = forwardFromQuat(s.quat);
-    // Vector to goal in world space.
+    // Unit vector to the goal in world space.
     let dx = tx - s.pos.x, dy = ty - s.pos.y, dz = tz - s.pos.z;
     const d = Math.hypot(dx, dy, dz) || 1;
     dx /= d; dy /= d; dz /= d;
-    // Build the ship's local axes from the quaternion to project the goal into local (right/up/fwd).
+    // Ship-local axes so we can express the goal bearing as left/right + up/down error.
     const right = quatRight(s.quat);
     const up = quatUp(s.quat);
-    const fdot = dx * fwd.x + dy * fwd.y + dz * fwd.z;      // 1 = dead ahead, -1 = behind
+    const fdot = dx * fwd.x + dy * fwd.y + dz * fwd.z;       // 1 = dead ahead, -1 = behind
     const rdot = dx * right.x + dy * right.y + dz * right.z; // + = goal to the right
-    const udot = dx * up.x + dy * up.y + dz * up.z;          // + = goal above
-    // Map bearing error to steering offsets. steerX yaws toward the goal's left/right; steerY pitches.
-    // A gain > 1 with clamping gives a snappy but bounded turn. Sign matches stepShip's mapping
-    // (pitchRate = -steerY*TURN, yawRate = -steerX*TURN): to yaw RIGHT toward a right-side goal we
-    // need a negative steerX, so steerX = -rdot*gain; to pitch UP toward a high goal, steerY = -udot.
-    const gain = 2.2;
-    let steerX = clamp(-rdot * gain + ai.jitterX, -1.4, 1.4);
-    let steerY = clamp(-udot * gain + ai.jitterY, -1.4, 1.4);
-    // If the goal is roughly behind, hard-bank into the turn so the bot swings around instead of
-    // dithering with tiny offsets near the singular "straight back" bearing.
-    if (fdot < -0.2) { steerX = clamp(steerX * 1.6 + (steerX >= 0 ? 0.5 : -0.5), -1.4, 1.4); }
-    const roll = clamp(-rdot * 0.7, -1, 1);   // bank into turns for a natural look
+    const udot = dx * up.x + dy * up.y + dz * up.z;          // + = goal above/below
+
+    // Convert the bearing error into an ANGLE-proportional turn command, not a saturating one. rdot/
+    // udot are the sines of the horizontal/vertical bearing error; using them directly (times a
+    // modest gain) means a nose that's nearly on-target commands a SMALL deflection and the ship
+    // flies straight, while a wide bearing commands a firm — but not pinned — turn. This is the fix
+    // for the "endless barrel roll": the old code saturated steerX/steerY to full deflection for any
+    // error at all, so a bot could never settle wings-level on its target and just corkscrewed.
+    // steer sign matches stepShip (yawRate = -steerX*TURN, pitchRate = -steerY*TURN): to yaw toward a
+    // right-side goal we need negative steerX, hence -rdot; to pitch toward a high goal, -udot.
+    const YAW_GAIN = 1.35;   // horizontal turn authority
+    const PITCH_GAIN = 0.9;  // gentler vertical authority so bots turn mostly in-plane (natural look)
+    let steerX = -rdot * YAW_GAIN + ai.jitterX;
+    let steerY = -udot * PITCH_GAIN + ai.jitterY;
+    // Goal is behind us: rdot/udot go small near the singular "straight back" bearing, so nudge a
+    // consistent yaw so the bot commits to swinging AROUND instead of pitching over the top (a loop).
+    if (fdot < 0) {
+      const dir = rdot >= 0 ? 1 : -1;           // keep turning the way we're already leaning
+      steerX = -dir * (0.6 + 0.5 * (1 + fdot)); // firmer yaw the more directly behind the goal is
+      steerY *= 0.35;                            // suppress pitch so it turns flat, not over the top
+    }
+    steerX = clamp(steerX, -1.0, 1.0);
+    steerY = clamp(steerY, -0.8, 0.8);
+    // Bank PROPORTIONALLY into the yaw for a natural coordinated turn — and only as much as we're
+    // actually yawing. A constant/hard roll while also pitching is precisely what read as a barrel
+    // roll; tying roll to the (bounded) yaw command keeps the wings level when flying straight.
+    const roll = clamp(steerX * 0.5, -0.7, 0.7);
     return { seq: 0, steerX, steerY, roll, thrust: true, reverse: false, boost: false };
   }
 
@@ -360,7 +380,6 @@ export class DemoBots {
 
 // --- module-local math (no THREE dependency) --------------------------------------------------
 function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
-function dtSafe() { return 1 / 30; }   // fixed tick step for wander phase advance
 
 // Ship-local RIGHT axis (+X) from a quaternion.
 function quatRight(q) {
