@@ -131,6 +131,9 @@ export class DemoBots {
       // A stable per-bot angular slot so escorts/attackers fan out AROUND their objective instead of
       // stacking on the same point (reads like a squad spreading out, not a conga line).
       slot: Math.random() * Math.PI * 2,
+      // A FIXED per-bot fan angle for the loose-pod approach so a contesting bot commits to ONE
+      // stable approach vector into the pod (a moving offset would make it gently orbit the pod).
+      fanAngle: Math.random() * Math.PI * 2,
       jitterX: 0, jitterY: 0, jitterAt: 0,
     });
 
@@ -203,22 +206,27 @@ export class DemoBots {
     if (goal.precision) {
       input.boost = false;
       const d = goal.dist;
-      if (d > 160) {
-        // Still far: bear down at full thrust (already the default), just no boost so we can settle.
+      if (d > 220) {
+        // Far out: bear straight down on the pod at full thrust (default). Allow a light boost when
+        // it's a long way off so the whole team actually converges on the objective quickly.
         input.thrust = true; input.reverse = false;
-      } else if (aligned < 0.55) {
-        // Close but NOT lined up on the pod: cut throttle and let drag bleed speed while we turn onto
-        // it, instead of blasting past at full speed and having to loop back for another pass.
+        input.boost = d > 640;
+      } else if (aligned < 0.2) {
+        // Genuinely pointed the WRONG way (pod off to the side/behind): ease off the throttle just
+        // enough to whip the nose back onto it, then re-commit. We only bleed speed when badly out of
+        // alignment now — not at the old 0.55 cutoff, which had bots coasting to a crawl on every
+        // approach and drifting past the tiny window (the root of the "circles near the pod" look).
         input.thrust = false; input.reverse = false;
-      } else if (d > 55) {
-        // Close and lined up: ease in on partial power (coast) so we arrive slow and controllable.
-        input.thrust = d > 95; input.reverse = false;
+      } else if (d > 70) {
+        // Closing and roughly lined up: keep DRIVING toward the pod. Momentum carries a fighter into
+        // the 22u window far more reliably than the old timid coast did.
+        input.thrust = true; input.reverse = false;
       } else {
-        // In the pocket, lined up: feather the throttle to trickle the last few units into the 22u
-        // window without overshooting; if we somehow blew past (pod now behind), reverse-brake hard so
-        // we kill velocity and swing back TIGHT rather than arcing out into a wide loop.
+        // Final pocket (<70u), lined up: feather so we settle INTO the window instead of blasting
+        // through it. If we've actually overshot (pod now behind us), reverse-brake hard to kill
+        // velocity and swing back TIGHT rather than arcing out into a wide loop.
         if (aligned < 0) { input.thrust = false; input.reverse = true; }
-        else { input.thrust = d > 30; input.reverse = false; }
+        else { input.thrust = d > 34; input.reverse = false; }
       }
     }
 
@@ -286,7 +294,11 @@ export class DemoBots {
     // nearby so both squadrons swarm the objective and the human always has bodies around it.
     if (flag) {
       const fp = { x: flag.px, y: flag.py, z: flag.pz };
-      ai.role = this._amClosestFew(sid, team, fp, 3) ? 'grab' : 'contest';   // 3 closest per team commit to the run
+      // STICKY final approach: once I'm inside 140u of a loose pod I stay committed to the grab even
+      // if a teammate momentarily edges closer — otherwise a role flip mid-pocket jerks my goal point
+      // and I peel off into exactly the loop we're trying to kill. Finish the run.
+      const nearPod = this._dist(s.pos, fp) < 140;
+      ai.role = (nearPod || this._amClosestFew(sid, team, fp, 5)) ? 'grab' : 'contest';   // most of the team commits to the grab run
       // While contesting, a bot still shoots any enemy that strays close to it near the pod.
       ai.targetId = this._nearestHostile(s, team) || '';
       return;
@@ -338,34 +350,39 @@ export class DemoBots {
           const d = this._dist(s.pos, { x: threat.px, y: threat.py, z: threat.pz });
           return { x: lead.x, y: lead.y, z: lead.z, dist: d, shoot: true, targetShip: threat, targetId: ai.escortThreat };
         }
-        // No immediate threat -> hold a fanned-out escort slot just off the carrier's flank.
-        const slot = this._slotAround(carrier.px, carrier.py, carrier.pz, ai, 120);
-        return { x: slot.x, y: slot.y, z: slot.z, dist: this._dist(s.pos, slot), shoot: false, targetShip: null, targetId: '' };
+        // No immediate threat -> screen the carrier by flying to a point just BEHIND/beside it along
+        // its own heading (a wing position that moves WITH the carrier), rather than orbiting a fixed
+        // slot the escort can never settle on. Because the anchor tracks the carrier's motion, the
+        // escort flies a real formation line instead of corkscrewing.
+        const cvx = carrier.vx || 0, cvy = carrier.vy || 0, cvz = carrier.vz || 0;
+        const cs = Math.hypot(cvx, cvy, cvz) || 1;
+        // Unit heading of the carrier; drop back ~70u and fan ~55u to the side per this bot's slot.
+        const bx = -cvx / cs, by = -cvy / cs, bz = -cvz / cs;
+        const side = Math.cos(ai.slot);   // -1..1 spread so escorts sit on alternating flanks
+        const wx = carrier.px + bx * 70 + side * 55;
+        const wy = carrier.py + by * 70;
+        const wz = carrier.pz + bz * 70 + Math.sin(ai.slot) * 55;
+        return { x: wx, y: wy, z: wz, dist: this._dist(s.pos, { x: wx, y: wy, z: wz }), shoot: false, targetShip: null, targetId: '' };
       }
       // Carrier gone -> fall through to contest the loose pod.
     }
 
-    // GRAB: I'm one of the closest -> fly straight at the loose/center pod to pick it up. Flagged
-    // `precision` so _think eases the throttle on the final approach: at 74 u/s a fighter blows
-    // through the 22u pickup window in a third of a second, so a full-speed pass almost always MISSES
-    // and the bot loops back — the "gets close then circles" bug. Precision approach brakes it into
-    // the pocket so grabs actually connect. `grab:true` also tells _think to line up before committing.
-    if (flag && !flag.carrier && ai.role === 'grab') {
-      const fp = { x: flag.px, y: flag.py, z: flag.pz };
-      return { x: fp.x, y: fp.y, z: fp.z, dist: this._dist(s.pos, fp), shoot: false, targetShip: null, targetId: '', precision: true, grab: true };
-    }
-
-    // CONTEST (default when there's a loose pod): stage on a slot AROUND the pod so we're on top of
-    // the action the instant it's grabbed — and shoot any enemy that wanders into our lap near it.
-    if (flag) {
-      const slot = this._slotAround(flag.px, flag.py, flag.pz, ai, 260);
-      const tgt = ai.targetId && room.state.ships.get(ai.targetId);
-      const shootTgt = tgt && tgt.alive && tgt.team !== team && this._dist(s.pos, { x: tgt.px, y: tgt.py, z: tgt.pz }) < BOT_ENGAGE_RANGE;
-      if (shootTgt) {
-        const lead = this._leadPoint(s, tgt, 0.4);
-        return { x: lead.x, y: lead.y, z: lead.z, dist: this._dist(s.pos, { x: tgt.px, y: tgt.py, z: tgt.pz }), shoot: true, targetShip: tgt, targetId: ai.targetId };
-      }
-      return { x: slot.x, y: slot.y, z: slot.z, dist: this._dist(s.pos, slot), shoot: false, targetShip: null, targetId: '' };
+    // LOOSE POD (grab OR contest): EVERY bot flies STRAIGHT AT THE POD to pick it up. There is no
+    // "stage on a slot far from the pod and orbit it" behavior anymore — that fixed-offset staging is
+    // exactly what made most bots loiter and corkscrew right next to the objective instead of taking
+    // it. Now the pod is the goal for the whole team, so it gets genuinely swarmed and grabbed fast.
+    //
+    // A tiny per-bot offset (from the persistent `slot` angle) fans the approach vectors so the pack
+    // doesn't collapse onto one identical point and collide; it's small (18u) so bots still converge
+    // on the pod, not on a ring around it. `precision` brakes the final approach into the 22u pickup
+    // window; `grab` marks the committed grabbers so _think lines them up before feathering in.
+    if (flag && !flag.carrier) {
+      const off = ai.role === 'grab' ? 0 : 18;   // committed grabbers aim dead-center; others fan slightly
+      const ang = ai.fanAngle;   // FIXED per-bot angle -> a stable approach vector, not a drifting orbit
+      const gx = flag.px + Math.cos(ang) * off;
+      const gy = flag.py + Math.sin(ang * 0.7) * off * 0.4;
+      const gz = flag.pz + Math.sin(ang) * off;
+      return { x: gx, y: gy, z: gz, dist: this._dist(s.pos, { x: flag.px, y: flag.py, z: flag.pz }), shoot: false, targetShip: null, targetId: '', precision: true, grab: ai.role === 'grab' };
     }
 
     // Absolute fallback (no flag object): press toward arena center so bots never drift off alone.
@@ -378,15 +395,6 @@ export class DemoBots {
   _leadPoint(s, tgt, k) {
     const vx = tgt.vx || 0, vy = tgt.vy || 0, vz = tgt.vz || 0;
     return { x: tgt.px + vx * k, y: tgt.py + vy * k, z: tgt.pz + vz * k };
-  }
-
-  // A stable, fanned-out slot on a sphere of radius `R` around a point, using this bot's persistent
-  // angular slot. Keeps escorts/contesters spread AROUND the objective (a screen), not stacked on it,
-  // and — crucially — the slot is a fixed offset, not a moving orbit, so bots fly TO it and hold
-  // rather than corkscrewing around a point they can never reach.
-  _slotAround(cx, cy, cz, ai, R) {
-    const a = ai.slot;
-    return { x: cx + Math.cos(a) * R, y: cy + Math.sin(a * 0.7) * (R * 0.35), z: cz + Math.sin(a) * R };
   }
 
   // Build a steering input frame that points the ship's nose toward (tx,ty,tz). Converts the bearing
@@ -425,8 +433,11 @@ export class DemoBots {
       steerX = -dir * (0.6 + 0.5 * (1 + fdot)); // firmer yaw the more directly behind the goal is
       steerY *= 0.35;                            // suppress pitch so it turns flat, not over the top
     }
-    steerX = clamp(steerX, -1.0, 1.0);
-    steerY = clamp(steerY, -0.8, 0.8);
+    // Allow a firm turn (up to the flight model's own ±1.4 steer range) so a bot can actually swing
+    // its nose onto the pod on a close approach instead of arcing wide past it. The old ±1.0 cap left
+    // bots under-steering near the objective, which read as a lazy loop.
+    steerX = clamp(steerX, -1.3, 1.3);
+    steerY = clamp(steerY, -1.0, 1.0);
     // Bank PROPORTIONALLY into the yaw for a natural coordinated turn — and only as much as we're
     // actually yawing. A constant/hard roll while also pitching is precisely what read as a barrel
     // roll; tying roll to the (bounded) yaw command keeps the wings level when flying straight.
