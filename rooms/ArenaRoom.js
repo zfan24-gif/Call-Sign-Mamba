@@ -12,6 +12,13 @@ import { Room } from '@colyseus/core';
 import { ArenaState, Ship, Bolt, Missile, Cargo } from './schema.js';
 import { stepShip, forwardFromQuat, yawQuatToward } from '../shared/flightModel.js';
 import { sanitizeShip, statsFor } from './shipStats.js';
+// ---- DEMO-ONLY (REMOVE BEFORE SHIP) ----------------------------------------------------------
+// AI squadron filler so a CTC lobby can be recorded with a lively 4v5 match WITHOUT 9 human pilots.
+// See DemoBots.js. Everything is gated behind DEMO_BOTS below and namespaced under `bot:` session
+// ids, so ripping it out later is: delete this import, the DEMO_BOTS block, and DemoBots.js.
+import { DemoBots } from './DemoBots.js';
+// Master switch for the demo squadron. Flip to false (or delete the DemoBots wiring) to disable.
+const DEMO_BOTS = true;
 
 const TICK_HZ = 30;                 // authoritative simulation rate
 const TICK_MS = 1000 / TICK_HZ;
@@ -282,6 +289,9 @@ export class ArenaRoom extends Room {
       // Whitelist the mode: Squadron Death Match (teams), Free-For-All (every-man-for-himself), or
       // Capture the Cargo (team capture-the-flag). Anything else is ignored.
       if (msg.mode === 'sdm' || msg.mode === 'ffa' || msg.mode === 'ctc') this.state.mode = msg.mode;
+      // DEMO-ONLY (REMOVE BEFORE SHIP): arm the AI squadron when the host selects CTC in the lobby,
+      // and tear it down if they switch back to another mode so SDM/FFA stay pure-human.
+      this.maybeArmDemoBots();
       const d = Number(msg.roundDuration);
       if (ROUND_DURATIONS.includes(d)) {
         this.state.roundDuration = d;
@@ -346,6 +356,13 @@ export class ArenaRoom extends Room {
     this._now = 0;       // accumulated sim time in seconds (for cooldowns / regen / respawn timers)
     this._collideCd = new Map(); // "sidA|sidB" -> sim time a ram-pair may next collide-damage
 
+    // ---- DEMO-ONLY (REMOVE BEFORE SHIP) ------------------------------------------------------
+    // AI squadron filler. Armed automatically the moment a human host runs a CTC lobby (see
+    // maybeArmDemoBots), so recording the demo needs no extra clicks. Bots are namespaced `bot:`
+    // and live in state.ships + sim, so every combat/collision/cargo/scoring loop treats them as
+    // players. Cleared when leaving CTC, at match start, and on dispose.
+    this.demoBots = DEMO_BOTS ? new DemoBots(this) : null;
+
     // Broadcast state patches at the SAME 30Hz as the sim (Colyseus defaults to 20Hz/50ms, which
     // makes remote ships update slower than they actually move and pads perceived latency). Matching
     // the patch rate to TICK_HZ means every authoritative tick is replicated, tightening remote motion.
@@ -393,6 +410,31 @@ export class ArenaRoom extends Room {
   // between the two bases, so both teams have an equal run for it.
   cargoHome() {
     return { x: 0, y: 0, z: 0 };
+  }
+
+  // A team's raw SPAWN anchor as a plain {x,y,z} (where fresh pilots seat before a match). Exposed
+  // as a method so helpers/modules (e.g. the demo bots) don't reach into the module-scope SPAWN
+  // const. This is the un-spread anchor; the CTC base is baseCenter() (spread far out).
+  spawnAnchor(team) {
+    const sp = SPAWN[team] || SPAWN[0];
+    return { x: sp.pos[0], y: sp.pos[1], z: sp.pos[2] };
+  }
+
+  // The point a team should aim its nose at on spawn: the OTHER team's spawn anchor. Method form of
+  // ENEMY_ANCHOR so modules can call it without importing the const.
+  enemyAnchor(team) {
+    const a = ENEMY_ANCHOR[team] || ENEMY_ANCHOR[0];
+    return { x: a.x, y: a.y, z: a.z };
+  }
+
+  // DEMO-ONLY (REMOVE BEFORE SHIP): keep the AI squadron in sync with the lobby mode. Arm the bots
+  // (staggered join + ready-up) the first time the room is a CTC lobby; clear them if the host
+  // switches back to SDM/FFA so those modes stay pure-human. Safe to call repeatedly (arm() and
+  // clear() both self-guard against redundant calls).
+  maybeArmDemoBots() {
+    if (!this.demoBots) return;
+    if (this.isCTC() && this.state.matchState === 'lobby') this.demoBots.arm();
+    else if (!this.isCTC()) this.demoBots.clear();
   }
 
   onJoin(client, options) {
@@ -546,6 +588,11 @@ export class ArenaRoom extends Room {
         this.endMatch();
       }
     }
+
+    // --- 0c) DEMO-ONLY (REMOVE BEFORE SHIP): AI squadron --------------------------------------
+    // Run bot brains BEFORE the movement integrator so the input each bot stamps this tick (into its
+    // sim scratch) is the input integrated below — bots move exactly like players, no special path.
+    if (this.demoBots) this.demoBots.update(FIXED_DT);
 
     // --- 1) Ships: integrate movement, regen shields, handle respawn --------------------------
     for (const [sessionId, s] of this.sim) {
@@ -1399,6 +1446,12 @@ export class ArenaRoom extends Room {
       blueKills: b, redKills: r,
     });
     console.log(`[arena] MATCH END — BLUE ${b} : ${r} RED -> winner=${this.state.winningTeam === -1 ? 'DRAW' : this.state.winningTeam === 0 ? 'BLUE' : 'RED'} [roomId=${this.roomId}]`);
+  }
+
+  // Room teardown: cancel the demo squadron's pending join/ready timers so no setTimeout fires into a
+  // disposed room. DEMO-ONLY (REMOVE BEFORE SHIP) — safe to delete with the rest of the bot wiring.
+  onDispose() {
+    if (this.demoBots) this.demoBots.clear();
   }
 }
 
