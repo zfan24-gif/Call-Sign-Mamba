@@ -187,9 +187,40 @@ export class DemoBots {
     // Resolve a world-space GOAL point to fly toward + whether it's a ship to shoot.
     const goal = this._goalPoint(sid, ai, s, ship);
     const input = this._steerToward(s, goal.x, goal.y, goal.z, ai);
+    const aligned = input._fdot;   // 1 = goal dead ahead, <0 = behind us (overshot)
 
-    // Boost to close big gaps (or run the flag home) — but not while lined up for a close shot.
-    input.boost = goal.dist > BOT_BOOST_RANGE && !goal.shoot;
+    // THROTTLE / BOOST control. Default: boost only to close big gaps, and NOT while lined up for a
+    // close shot (so a dogfighter doesn't overshoot its target). EXCEPTION: when hunting/escorting a
+    // flag CARRIER we boost even at range so pursuers can actually run down a boosting carrier —
+    // otherwise the carrier just outruns everyone and it stops looking like a real chase.
+    const chasingCarrier = goal.chase && goal.dist > BOT_BOOST_RANGE;
+    input.boost = (chasingCarrier || (goal.dist > BOT_BOOST_RANGE && !goal.shoot)) && !goal.precision;
+
+    // PRECISION APPROACH to the pod (grab): a fighter can't stop, and at ~74 u/s it clears the 22u
+    // pickup window in ~0.3s — a full-speed pass almost always MISSES and the bot loops back forever.
+    // So on the final approach we throttle DOWN and even reverse-brake so the bot decelerates INTO the
+    // pocket and actually connects. This is the single biggest fix for "gets close then circles".
+    if (goal.precision) {
+      input.boost = false;
+      const d = goal.dist;
+      if (d > 160) {
+        // Still far: bear down at full thrust (already the default), just no boost so we can settle.
+        input.thrust = true; input.reverse = false;
+      } else if (aligned < 0.55) {
+        // Close but NOT lined up on the pod: cut throttle and let drag bleed speed while we turn onto
+        // it, instead of blasting past at full speed and having to loop back for another pass.
+        input.thrust = false; input.reverse = false;
+      } else if (d > 55) {
+        // Close and lined up: ease in on partial power (coast) so we arrive slow and controllable.
+        input.thrust = d > 95; input.reverse = false;
+      } else {
+        // In the pocket, lined up: feather the throttle to trickle the last few units into the 22u
+        // window without overshooting; if we somehow blew past (pod now behind), reverse-brake hard so
+        // we kill velocity and swing back TIGHT rather than arcing out into a wide loop.
+        if (aligned < 0) { input.thrust = false; input.reverse = true; }
+        else { input.thrust = d > 30; input.reverse = false; }
+      }
+    }
 
     // Fire control: bolts when a hostile is close and roughly ahead; the odd missile at mid range.
     if (goal.shoot && goal.targetShip) {
@@ -250,11 +281,12 @@ export class DemoBots {
       }
     }
 
-    // No carrier -> contest the loose/center pod. The closest few actually go for the grab; the rest
-    // stage nearby so the pod is swarmed by BOTH teams and the human always has bodies around it.
+    // No carrier -> contest the loose/center pod. A healthy chunk of each team actually goes for the
+    // grab (so the pod is genuinely fought over and someone reliably picks it up), and the rest stage
+    // nearby so both squadrons swarm the objective and the human always has bodies around it.
     if (flag) {
       const fp = { x: flag.px, y: flag.py, z: flag.pz };
-      ai.role = this._amClosestFew(sid, team, fp, 3) ? 'grab' : 'contest';
+      ai.role = this._amClosestFew(sid, team, fp, 3) ? 'grab' : 'contest';   // 3 closest per team commit to the run
       // While contesting, a bot still shoots any enemy that strays close to it near the pod.
       ai.targetId = this._nearestHostile(s, team) || '';
       return;
@@ -287,7 +319,9 @@ export class DemoBots {
       if (carrier && carrier.alive && carrier.carrying) {
         const lead = this._leadPoint(s, carrier, 0.5);
         const d = this._dist(s.pos, { x: carrier.px, y: carrier.py, z: carrier.pz });
-        return { x: lead.x, y: lead.y, z: lead.z, dist: d, shoot: true, targetShip: carrier, targetId: ai.targetId };
+        // chase:true lets _think boost after a fleeing/boosting carrier even though we also want to
+        // shoot it — so the enemy team genuinely runs down a blue-team human hauling the pod home.
+        return { x: lead.x, y: lead.y, z: lead.z, dist: d, shoot: true, targetShip: carrier, targetId: ai.targetId, chase: true };
       }
       // Carrier gone/dropped it since we last retargeted -> fall through to contest the loose pod.
     }
@@ -311,10 +345,14 @@ export class DemoBots {
       // Carrier gone -> fall through to contest the loose pod.
     }
 
-    // GRAB: I'm one of the closest -> fly straight at the loose/center pod to pick it up.
+    // GRAB: I'm one of the closest -> fly straight at the loose/center pod to pick it up. Flagged
+    // `precision` so _think eases the throttle on the final approach: at 74 u/s a fighter blows
+    // through the 22u pickup window in a third of a second, so a full-speed pass almost always MISSES
+    // and the bot loops back — the "gets close then circles" bug. Precision approach brakes it into
+    // the pocket so grabs actually connect. `grab:true` also tells _think to line up before committing.
     if (flag && !flag.carrier && ai.role === 'grab') {
       const fp = { x: flag.px, y: flag.py, z: flag.pz };
-      return { x: fp.x, y: fp.y, z: fp.z, dist: this._dist(s.pos, fp), shoot: false, targetShip: null, targetId: '' };
+      return { x: fp.x, y: fp.y, z: fp.z, dist: this._dist(s.pos, fp), shoot: false, targetShip: null, targetId: '', precision: true, grab: true };
     }
 
     // CONTEST (default when there's a loose pod): stage on a slot AROUND the pod so we're on top of
@@ -393,7 +431,9 @@ export class DemoBots {
     // actually yawing. A constant/hard roll while also pitching is precisely what read as a barrel
     // roll; tying roll to the (bounded) yaw command keeps the wings level when flying straight.
     const roll = clamp(steerX * 0.5, -0.7, 0.7);
-    return { seq: 0, steerX, steerY, roll, thrust: true, reverse: false, boost: false };
+    // Return the alignment (fdot: 1 = goal dead ahead) so _think can gate throttle/braking on the
+    // final precision approach to the pod (only bear down on the pickup window when actually lined up).
+    return { seq: 0, steerX, steerY, roll, thrust: true, reverse: false, boost: false, _fdot: fdot };
   }
 
   // --- small helpers -------------------------------------------------------------------------

@@ -31,6 +31,47 @@ export const FLIGHT = {
   BOUNDARY_PULL: 0.5,
 };
 
+// ---- Engine boost heat / overheat model ------------------------------------------------------
+// Boosting is powerful but no longer free: holding boost spins the engines up thermally, and if a
+// pilot (or bot) leans on it too long the engines OVERHEAT and enter a forced cooldown during which
+// the ship flies SLOWER than its normal (un-boosted) top speed until the heat bleeds off. This is a
+// deliberate risk/reward layer that shapes dogfights the same in single-player and multiplayer, so
+// it lives in the shared model and is applied identically by the client prediction, the authoritative
+// server, and the bot simulation. Heat is a plain 0..1 gauge stored on the ship state.
+export const HEAT = {
+  RISE: 0.34,      // heat/sec added while actively boosting (~2.9s of boost from cold trips overheat)
+  FALL: 0.22,      // heat/sec shed while NOT boosting (normal passive cooling)
+  COOL_FALL: 0.30, // faster heat/sec shed while LOCKED OUT (overheated) so the penalty is punishing but not endless
+  MAX: 1.0,        // heat level that TRIPS overheat (engines cut boost + throttle back)
+  RESET: 0.45,     // heat must fall back below this to clear overheat (hysteresis: no instant re-boost at the top)
+  PENALTY: 0.62,   // top-speed / thrust multiplier while overheated (flies at 62% of normal — clearly slower)
+};
+
+// Advance one ship's engine heat by `dt` given whether the pilot is COMMANDING boost this tick, and
+// resolve what actually happens to the engines. Mutates + reads `state.heat` (a {v, over} object,
+// lazily created). Returns { boost, mult }:
+//   boost = whether boost speed actually applies this tick (false while overheated, even if held)
+//   mult  = extra multiplier on top-speed/thrust (1 normally, HEAT.PENALTY while overheated)
+// Keeping this separate lets the single-player flight loop (which isn't stepShip) share the exact
+// same thermal behavior by calling it directly.
+export function stepBoostHeat(state, boostHeld, dt) {
+  let h = state.heat;
+  if (!h || typeof h !== 'object') { h = state.heat = { v: 0, over: false }; }
+  const wantBoost = !!boostHeld && !h.over;   // a locked-out engine ignores the boost key
+  // Heat rises only when boost is actually engaged; otherwise it cools. Overheated engines cool faster.
+  if (wantBoost) {
+    h.v += HEAT.RISE * dt;
+  } else {
+    h.v -= (h.over ? HEAT.COOL_FALL : HEAT.FALL) * dt;
+  }
+  if (h.v < 0) h.v = 0;
+  if (h.v > HEAT.MAX) h.v = HEAT.MAX;
+  // Trip / clear overheat with hysteresis so it can't chatter at the threshold.
+  if (!h.over && h.v >= HEAT.MAX) h.over = true;
+  else if (h.over && h.v <= HEAT.RESET) h.over = false;
+  return { boost: wantBoost, mult: h.over ? HEAT.PENALTY : 1 };
+}
+
 // ---- Tiny quaternion helpers (no THREE dependency) -------------------------------------------
 // Rotate a quaternion q by a LOCAL-space euler delta (pitch about X, yaw about Y, roll about Z),
 // applied in XYZ order and post-multiplied so it composes in the ship's own frame — exactly like
@@ -118,9 +159,18 @@ export function stepShip(state, input, dt, speedScale = 1) {
   if (input.thrust) { ax += fwd.x; ay += fwd.y; az += fwd.z; accel = true; }
   if (input.reverse) { ax -= fwd.x * FLIGHT.REVERSE; ay -= fwd.y * FLIGHT.REVERSE; az -= fwd.z * FLIGHT.REVERSE; accel = true; }
 
-  const boost = !!input.boost;
+  // Boost is gated by engine heat: leaning on boost spins the engines up and, past the limit, trips
+  // an overheat that CANCELS boost and throttles the ship BELOW its normal top speed until it cools.
+  // (input._noHeat is only ever set by the CLIENT reconciliation replay so it doesn't double-step the
+  // heat gauge; the server always steps heat normally, but we honor the flag to keep the models identical.)
+  const heat = input._noHeat
+    ? { boost: !!input.boost && !(state.heat && state.heat.over), mult: (state.heat && state.heat.over) ? HEAT.PENALTY : 1 }
+    : stepBoostHeat(state, input.boost, dt);
+  const boost = heat.boost;
   const hullScale = Number.isFinite(speedScale) && speedScale > 0 ? speedScale : 1;
-  const speedMod = (boost ? FLIGHT.BOOST_MULT : 1) * hullScale;
+  // heat.mult (< 1 while overheated) scales both thrust and top speed so an overheated ship is
+  // unmistakably sluggish until the cooldown clears.
+  const speedMod = (boost ? FLIGHT.BOOST_MULT : 1) * hullScale * heat.mult;
 
   if (ax || ay || az) {
     const len = Math.hypot(ax, ay, az) || 1;
