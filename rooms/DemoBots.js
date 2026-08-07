@@ -124,10 +124,13 @@ export class DemoBots {
     // Per-bot AI scratch (server-only).
     this._bots.set(sid, {
       team: spec.team,
-      targetId: null,
+      role: 'contest',       // cargo-centric role this bot is currently playing (see _assignRole)
+      targetId: null,        // the ship this role wants to engage/escort ('' = none, fly the objective)
       retargetAt: 0,
       botMissileCd: BOT_MISSILE_COOLDOWN * Math.random(),
-      wanderPhase: Math.random() * Math.PI * 2,
+      // A stable per-bot angular slot so escorts/attackers fan out AROUND their objective instead of
+      // stacking on the same point (reads like a squad spreading out, not a conga line).
+      slot: Math.random() * Math.PI * 2,
       jitterX: 0, jitterY: 0, jitterAt: 0,
     });
 
@@ -164,10 +167,11 @@ export class DemoBots {
   // Decide this bot's intent and stamp a fresh input frame for the integrator to apply this tick.
   _think(sid, ai, s, ship, dt) {
     const room = this.room;
-    // Occasionally re-evaluate the tactical target so behavior isn't perfectly steady.
+    // Occasionally re-evaluate our cargo-centric ROLE + engagement target so behavior isn't perfectly
+    // steady (and so the squad re-forms around the flag as it changes hands).
     if (room._now >= ai.retargetAt) {
       ai.retargetAt = room._now + BOT_RETARGET_SEC * (0.7 + Math.random() * 0.6);
-      ai.targetId = this._pickIntent(sid, ai, s, ship);
+      this._assignRole(sid, ai, s, ship);
     }
     // Refresh aim jitter a few times a second so steering has human-like imperfection.
     if (room._now >= ai.jitterAt) {
@@ -175,6 +179,10 @@ export class DemoBots {
       ai.jitterX = (Math.random() * 2 - 1) * BOT_REACT_JITTER;
       ai.jitterY = (Math.random() * 2 - 1) * BOT_REACT_JITTER;
     }
+    // Slowly drift this bot's staging slot so loitering escorts/contesters sweep a WIDE arc around
+    // their objective instead of fixating on one point they endlessly overshoot (which reads as a
+    // tight loop). Slow enough (~0.1 rad/s) that they still hold station near the cargo/carrier.
+    ai.slot += 0.0035;
 
     // Resolve a world-space GOAL point to fly toward + whether it's a ship to shoot.
     const goal = this._goalPoint(sid, ai, s, ship);
@@ -203,77 +211,144 @@ export class DemoBots {
     s.lastInput = input;
   }
 
-  // Choose this bot's high-level intent target sessionId (the ship it cares about most right now).
-  // Priorities that make the SHOW: contest/return the flag, gang the human flag-carrier, otherwise
-  // dogfight the nearest hostile. Returns a sessionId (may be a bot, the human, or '' for none).
-  _pickIntent(sid, ai, s, ship) {
+  // CARGO-CENTRIC role assignment — this is what makes every bot look like it understands the
+  // objective. There is ALWAYS a cargo (CTC), so every bot is always doing one of exactly three
+  // objective jobs; there is NO free-roam dogfight state that let them wander off in circles:
+  //
+  //   • flag has NO carrier (loose/at center): the ~3 closest bots on the team RACE to grab it
+  //     (role 'grab'); the rest press toward the pod to be first on the rebound (role 'contest').
+  //   • an ENEMY (bot or the human) carries it: EVERY hostile HUNTS the carrier (role 'hunt',
+  //     target = carrier); the carrier's own team ESCORTS it (role 'escort', target = carrier).
+  //   • a FRIENDLY (bot or the human) carries it: I ESCORT the carrier (role 'escort'); the other
+  //     team hunts. If I somehow am not on either objective, I still fly the pod.
+  //
+  // The role also carries the engagement target so _think knows who to shoot. Result: the flag is the
+  // gravity well of the match — exactly the "everyone's going for / defending / attacking the cargo"
+  // read you want, and the human is always surrounded by pilots who clearly care about the pod.
+  _assignRole(sid, ai, s, ship) {
     const room = this.room;
     const team = ship.team;
     const flag = room.state.cargo && room.state.cargo.get('flag');
-    // If a bot on THIS team is closer to a loose flag, let the closest chase it; but any bot may go.
-    if (flag) {
-      // Human (or anyone) carrying the flag: the enemy team converges on the carrier for the show.
-      if (flag.carrier) {
-        const carrier = room.state.ships.get(flag.carrier);
-        if (carrier && carrier.alive) {
-          if (carrier.team !== team) return flag.carrier;   // enemy carrier -> intercept them
-          // Friendly carrier -> escort by engaging the nearest THREAT to them instead of the carrier.
-          const threat = this._nearestHostileTo(carrier, team);
-          if (threat) return threat;
+
+    // I'm the carrier: my role is fixed (run it home) — handled in _goalPoint, but note it here.
+    if (ship.carrying) { ai.role = 'carry'; ai.targetId = ''; return; }
+
+    if (flag && flag.carrier) {
+      const carrier = room.state.ships.get(flag.carrier);
+      if (carrier && carrier.alive) {
+        if (carrier.team !== team) {
+          // Enemy has the pod -> HUNT the carrier (this is the "gang the flag-runner" show). Aim at
+          // the carrier itself so bolts/missiles go at the pod runner, not a random dogfight.
+          ai.role = 'hunt'; ai.targetId = flag.carrier; return;
         }
+        // Teammate has the pod -> ESCORT: stay on the carrier and shoot whoever is chasing them.
+        ai.role = 'escort'; ai.targetId = flag.carrier;
+        // Prefer to actually FIRE at the nearest threat to the carrier if there is one in range.
+        const threat = this._nearestHostileTo(carrier, team);
+        if (threat) ai.escortThreat = threat; else ai.escortThreat = '';
+        return;
       }
     }
-    // Default: dogfight the nearest live hostile.
-    return this._nearestHostile(s, team) || '';
+
+    // No carrier -> contest the loose/center pod. The closest few actually go for the grab; the rest
+    // stage nearby so the pod is swarmed by BOTH teams and the human always has bodies around it.
+    if (flag) {
+      const fp = { x: flag.px, y: flag.py, z: flag.pz };
+      ai.role = this._amClosestFew(sid, team, fp, 3) ? 'grab' : 'contest';
+      // While contesting, a bot still shoots any enemy that strays close to it near the pod.
+      ai.targetId = this._nearestHostile(s, team) || '';
+      return;
+    }
+
+    // No flag object at all (shouldn't happen in a live CTC match) -> just fly the center and fight.
+    ai.role = 'contest';
+    ai.targetId = this._nearestHostile(s, team) || '';
   }
 
-  // Resolve the concrete world GOAL point to fly at this tick, plus whether we should be shooting the
-  // target ship. This is where "carry the flag home" and "grab a loose flag" become movement.
+  // Resolve the concrete world GOAL point to fly at this tick from the assigned role, plus whether we
+  // should be shooting a specific ship. Every branch is tied to the CARGO, so bots always look like
+  // they're playing the objective.
   _goalPoint(sid, ai, s, ship) {
     const room = this.room;
     const team = ship.team;
     const flag = room.state.cargo && room.state.cargo.get('flag');
 
-    // 1) I'M carrying the flag -> run it to my own base (drive the capture for a lively match).
+    // CARRY: I have the pod -> beeline for my own base (this is what actually scores captures).
     if (ship.carrying) {
       const home = room.baseCenter(team);
       return { x: home.x, y: home.y, z: home.z, dist: this._dist(s.pos, home), shoot: false, targetShip: null, targetId: '' };
     }
 
-    // 2) A LOOSE / centered flag with no carrier -> the nearest couple of bots make a run at it, so
-    // the flag is always contested (the human always has action). Only chase if reasonably close or
-    // I'm among the closest on my team, to avoid the whole squad swarming one pod.
-    if (flag && !flag.carrier) {
-      const fp = { x: flag.px, y: flag.py, z: flag.pz };
-      const myD = this._dist(s.pos, fp);
-      if (myD < 700 || this._amClosestFew(sid, team, fp, 2)) {
-        return { x: fp.x, y: fp.y, z: fp.z, dist: myD, shoot: false, targetShip: null, targetId: '' };
+    // HUNT: an enemy carries the pod -> chase the carrier with a small LEAD so it looks like a real
+    // intercept, and shoot it whenever it's in front of us. This is the enemy team converging on the
+    // human when the human has the flag.
+    if (ai.role === 'hunt') {
+      const carrier = ai.targetId && room.state.ships.get(ai.targetId);
+      if (carrier && carrier.alive && carrier.carrying) {
+        const lead = this._leadPoint(s, carrier, 0.5);
+        const d = this._dist(s.pos, { x: carrier.px, y: carrier.py, z: carrier.pz });
+        return { x: lead.x, y: lead.y, z: lead.z, dist: d, shoot: true, targetShip: carrier, targetId: ai.targetId };
       }
+      // Carrier gone/dropped it since we last retargeted -> fall through to contest the loose pod.
     }
 
-    // 3) Otherwise pursue the tactical target. We CLOSE on an enemy from any distance (fly straight
-    // toward a far target instead of giving up and circling), but only open FIRE / treat it as a
-    // dogfight once we're inside BOT_ENGAGE_RANGE — beyond that it's just a heading to fly.
-    const tid = ai.targetId;
-    const tgt = tid && room.state.ships.get(tid);
-    if (tgt && tgt.alive) {
-      const tp = { x: tgt.px, y: tgt.py, z: tgt.pz };
-      const d = this._dist(s.pos, tp);
-      const inRange = d < BOT_ENGAGE_RANGE;
-      return { x: tp.x, y: tp.y, z: tp.z, dist: d, shoot: inRange && tgt.team !== team, targetShip: inRange ? tgt : null, targetId: inRange ? tid : '' };
+    // ESCORT: a teammate (or the human ally) carries the pod -> fly a slot NEAR the carrier so we
+    // screen it, and shoot the nearest chaser. This is the allies-protect-the-carrier show.
+    if (ai.role === 'escort') {
+      const carrier = ai.targetId && room.state.ships.get(ai.targetId);
+      if (carrier && carrier.alive && carrier.carrying) {
+        // If there's a threat chasing the carrier, peel off and gun it; otherwise ride formation.
+        const threat = ai.escortThreat && room.state.ships.get(ai.escortThreat);
+        if (threat && threat.alive) {
+          const lead = this._leadPoint(s, threat, 0.4);
+          const d = this._dist(s.pos, { x: threat.px, y: threat.py, z: threat.pz });
+          return { x: lead.x, y: lead.y, z: lead.z, dist: d, shoot: true, targetShip: threat, targetId: ai.escortThreat };
+        }
+        // No immediate threat -> hold a fanned-out escort slot just off the carrier's flank.
+        const slot = this._slotAround(carrier.px, carrier.py, carrier.pz, ai, 120);
+        return { x: slot.x, y: slot.y, z: slot.z, dist: this._dist(s.pos, slot), shoot: false, targetShip: null, targetId: '' };
+      }
+      // Carrier gone -> fall through to contest the loose pod.
     }
 
-    // 4) Nothing pressing (rare) -> fly a WIDE patrol toward the objective, NOT a tight orbit. A
-    // fighter can't hover, so orbiting a close point made bots corkscrew forever; instead we aim at a
-    // point well AHEAD of the objective, offset by a slow-drifting bearing, so the bot flies long,
-    // gentle S-curves across the arena and naturally re-acquires a target rather than looping in place.
-    const c = flag ? { x: flag.px, y: flag.py, z: flag.pz } : { x: 0, y: 0, z: 0 };
-    ai.wanderPhase += 0.006;                     // very slow drift (~0.18 rad/s) => long, lazy curves
-    const R = 900;                               // wide lead so the goal stays far ahead, never orbited
-    const gx = c.x + Math.cos(ai.wanderPhase) * R;
-    const gz = c.z + Math.sin(ai.wanderPhase) * R;
-    const gy = c.y + Math.sin(ai.wanderPhase * 0.5) * 120;
-    return { x: gx, y: gy, z: gz, dist: this._dist(s.pos, { x: gx, y: gy, z: gz }), shoot: false, targetShip: null, targetId: '' };
+    // GRAB: I'm one of the closest -> fly straight at the loose/center pod to pick it up.
+    if (flag && !flag.carrier && ai.role === 'grab') {
+      const fp = { x: flag.px, y: flag.py, z: flag.pz };
+      return { x: fp.x, y: fp.y, z: fp.z, dist: this._dist(s.pos, fp), shoot: false, targetShip: null, targetId: '' };
+    }
+
+    // CONTEST (default when there's a loose pod): stage on a slot AROUND the pod so we're on top of
+    // the action the instant it's grabbed — and shoot any enemy that wanders into our lap near it.
+    if (flag) {
+      const slot = this._slotAround(flag.px, flag.py, flag.pz, ai, 260);
+      const tgt = ai.targetId && room.state.ships.get(ai.targetId);
+      const shootTgt = tgt && tgt.alive && tgt.team !== team && this._dist(s.pos, { x: tgt.px, y: tgt.py, z: tgt.pz }) < BOT_ENGAGE_RANGE;
+      if (shootTgt) {
+        const lead = this._leadPoint(s, tgt, 0.4);
+        return { x: lead.x, y: lead.y, z: lead.z, dist: this._dist(s.pos, { x: tgt.px, y: tgt.py, z: tgt.pz }), shoot: true, targetShip: tgt, targetId: ai.targetId };
+      }
+      return { x: slot.x, y: slot.y, z: slot.z, dist: this._dist(s.pos, slot), shoot: false, targetShip: null, targetId: '' };
+    }
+
+    // Absolute fallback (no flag object): press toward arena center so bots never drift off alone.
+    return { x: 0, y: 0, z: 0, dist: this._dist(s.pos, { x: 0, y: 0, z: 0 }), shoot: false, targetShip: null, targetId: '' };
+  }
+
+  // A point LED slightly ahead of a moving target so a pursuer looks like it's intercepting, not tail-
+  // chasing. `k` scales how far ahead we aim (seconds of the target's current velocity). Uses the
+  // target's replicated velocity; a stationary target just returns its own position.
+  _leadPoint(s, tgt, k) {
+    const vx = tgt.vx || 0, vy = tgt.vy || 0, vz = tgt.vz || 0;
+    return { x: tgt.px + vx * k, y: tgt.py + vy * k, z: tgt.pz + vz * k };
+  }
+
+  // A stable, fanned-out slot on a sphere of radius `R` around a point, using this bot's persistent
+  // angular slot. Keeps escorts/contesters spread AROUND the objective (a screen), not stacked on it,
+  // and — crucially — the slot is a fixed offset, not a moving orbit, so bots fly TO it and hold
+  // rather than corkscrewing around a point they can never reach.
+  _slotAround(cx, cy, cz, ai, R) {
+    const a = ai.slot;
+    return { x: cx + Math.cos(a) * R, y: cy + Math.sin(a * 0.7) * (R * 0.35), z: cz + Math.sin(a) * R };
   }
 
   // Build a steering input frame that points the ship's nose toward (tx,ty,tz). Converts the bearing
