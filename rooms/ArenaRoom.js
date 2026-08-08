@@ -148,22 +148,40 @@ const CARGO_DROP_TIMEOUT = 25;     // seconds a loose pod floats before auto-ret
 // grabbed while home OR while loose (dropped by a killed carrier); it auto-returns home after a stale
 // timeout. A pilot may only carry ONE disk at a time. Reuses the CTC base spread + capture-radius
 // machinery; the disks key 'blueDisk'/'redDisk' in state.cargo with team = the OWNING team.
-const CDD_DISK_HOME_HEIGHT = 60;   // units the capture spot hovers ABOVE the owning team's base center
-const CDD_PICKUP_RADIUS = 26;      // units a pilot must be within of a home/loose disk to grab it
+// The capture spot hovers ABOVE the owning team's base center. It MUST sit clear of that base's solid
+// collision sphere (baseCollideRadius), or a pilot gets shoved out to the hull surface before ever
+// reaching the disk — which made the enemy disk physically unretrievable (worst on the big red
+// capital, whose 150u sphere buried a fixed-60u disk 90u deep in solid hull). We now derive the
+// height from the base's own collision radius plus a clear approach gap, so BOTH disks always float
+// just outside their hull with room to fly in and grab them, regardless of hull size.
+const CDD_DISK_HOME_GAP = 34;      // units the disk floats ABOVE the base's collision surface
+const CDD_PICKUP_RADIUS = 30;      // units a pilot must be within of a home/loose disk to grab it
 const CDD_DROP_TIMEOUT = 25;       // seconds a dropped disk floats before auto-returning to its home
 // Solid-capital collision: ships cannot fly THROUGH a base. Any ship whose center comes within this
 // radius of a base center is pushed back out to the surface (and its inward velocity killed).
 // PER-TEAM sizes: the two capitals are DIFFERENT hulls with very different lengths — the blue
 // flagship normalizes to ~140u long (half-length ~70), the red capital to ~260u long (half-length
-// ~130). A single 90u sphere fits blue but is buried deep inside the much longer red hull, which
-// made red-side collision AND cargo capture feel like the return point was on the far side of the
-// ship. Sizing each sphere to its own hull (roughly half the long axis, padded) fixes both. MUST
-// stay in sync with the client's CTC_BASE_COLLIDE_R map.
-const BASE_COLLIDE_RADIUS_TEAM = { 0: 90, 1: 150 };   // 0 = blue flagship, 1 = red capital
+// ~130). Sizing each sphere roughly to its own hull fixes both collision and capture. These were
+// tuned DOWN (blue 90->70, red 150->110): the old spheres were oversized walls that pushed pilots
+// away from the hull — combined with the disk buried inside them, the enemy disk was unreachable.
+// Tighter spheres hug each hull without the fat dead zone. MUST stay in sync with the client's
+// CTC_BASE_COLLIDE_R map.
+const BASE_COLLIDE_RADIUS_TEAM = { 0: 70, 1: 110 };   // 0 = blue flagship, 1 = red capital
 const BASE_COLLIDE_RADIUS = 90;    // legacy fallback (unused once per-team lookups are wired)
 const BASE_COLLIDE_PUSH = 2;       // extra separation (units) so a ship doesn't graze back in
-// Per-team helper: the solid collision radius for a given base team.
+// SOLID-CORE radius for the server's AUTHORITATIVE push-out. The full baseCollideRadius sphere is a
+// coarse ENVELOPE around the whole hull — but these capitals have OPEN launch bays a ship should be
+// able to fly straight through, and the server can't raycast the GLB to tell a bay from solid hull.
+// The CLIENT does that fine-grained point-in-mesh gating; here we only need a conservative core small
+// enough to sit ENTIRELY inside the dense central hull (never intruding into a bay opening) so the
+// server never rubber-bands a pilot back out of a bay, yet still stops a straight tunnel through the
+// ship's spine. Roughly 55% of the envelope. The outer baseCollideRadius still governs the CDD disk
+// float height + the CTC capture ring, so those stay anchored to the true hull envelope.
+const BASE_SOLID_CORE_TEAM = { 0: 40, 1: 62 };
+// Per-team helper: the OUTER hull-envelope radius (disk-home height + CTC capture ring reference).
 function baseCollideRadius(team) { return BASE_COLLIDE_RADIUS_TEAM[team] != null ? BASE_COLLIDE_RADIUS_TEAM[team] : BASE_COLLIDE_RADIUS; }
+// Per-team helper: the SOLID-CORE radius used for the authoritative collision push-out.
+function baseSolidCore(team) { return BASE_SOLID_CORE_TEAM[team] != null ? BASE_SOLID_CORE_TEAM[team] : BASE_COLLIDE_RADIUS; }
 
 // Team spawn anchors: blue spawns on one side of the arena, red on the other. The anchors sit on
 // OPPOSITE diagonal corners, so the old "face ±Z" scheme aimed each ship straight down its own
@@ -787,10 +805,13 @@ export class ArenaRoom extends Room {
   // Purely positional (no damage) — a base is a wall, not a weapon. Mirrors the client's local
   // base-collision so prediction and server truth agree.
   resolveBaseCollisions() {
-    // Pair each base center with ITS team's collision radius (blue and red hulls are different sizes).
+    // Pair each base center with ITS team's SOLID-CORE radius (blue and red hulls are different
+    // sizes). We push out of the conservative core only — never the full envelope — so a pilot flying
+    // through an OPEN launch bay isn't rubber-banded back out; the client's point-in-mesh probe does
+    // the fine-grained near-hull collision for the solid sections.
     const bases = [
-      { c: this.baseCenter(0), r: baseCollideRadius(0) },
-      { c: this.baseCenter(1), r: baseCollideRadius(1) },
+      { c: this.baseCenter(0), r: baseSolidCore(0) },
+      { c: this.baseCenter(1), r: baseSolidCore(1) },
     ];
     for (const [sid, ship] of this.state.ships) {
       if (!ship.alive) continue;
@@ -1139,12 +1160,14 @@ export class ArenaRoom extends Room {
 
   // ---- Capture the Data Disk (CDD) -------------------------------------------------------------
 
-  // The fixed CAPTURE SPOT for a team's disk: a point hovering CDD_DISK_HOME_HEIGHT units directly
-  // above that team's capital base center. This is both the disk's home rest position AND the spot a
+  // The fixed CAPTURE SPOT for a team's disk: a point hovering just above that team's capital base,
+  // clear of its solid collision sphere. This is both the disk's home rest position AND the spot a
   // carrier must reach to score (they return the ENEMY disk to THEIR OWN disk's spot).
   diskHome(team) {
     const b = this.baseCenter(team);
-    return { x: b.x, y: b.y + CDD_DISK_HOME_HEIGHT, z: b.z };
+    // Float the disk just OUTSIDE this team's solid collision sphere plus an approach gap, so a pilot
+    // can always fly in and grab it (a fixed height would bury it inside the bigger red hull).
+    return { x: b.x, y: b.y + baseCollideRadius(team) + CDD_DISK_HOME_GAP, z: b.z };
   }
 
   // Spawn BOTH team disks at their capture spots. Called once when a CDD match starts. Each disk's
