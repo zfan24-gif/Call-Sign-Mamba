@@ -208,26 +208,16 @@ export class DemoBots {
     const runningHome = goal.runHome && goal.dist > 120;
     input.boost = (runningHome || chasingCarrier || (goal.dist > BOT_BOOST_RANGE && !goal.shoot)) && !goal.precision;
 
-    // ---- UNIFIED TURN-RADIUS THROTTLE GOVERNOR --------------------------------------------------
+    // ---- THROTTLE GOVERNOR (loop prevention) ----------------------------------------------------
     // ROOT CAUSE of the wide loops: a fighter at full speed (74 u/s, turn rate 2.6 rad/s) has a
-    // MINIMUM TURN RADIUS of ~28u. If the goal is closer than the bot's current turn radius, NO amount
-    // of steering can curve onto it — the bot physically must arc past and loop back, forever. The old
-    // governors gated braking on the goal's ANGLE (aligned < 0.4), which missed every bot arcing wide
-    // at a moderate bearing, so they looped anyway. The correct, universal rule is physics: compare the
-    // bot's turn radius at its CURRENT speed to the distance-to-goal, and if it can't make the corner,
-    // SLOW DOWN until it can. This one rule replaces both ad-hoc governors and kills the loops.
+    // MINIMUM TURN RADIUS of ~28u. Carry that speed into a close goal and NO amount of steering can
+    // curve onto it — the bot arcs past and loops back, forever. The old governors gated braking on a
+    // hard ANGLE threshold, which missed bots arcing wide at moderate bearings. The block below instead
+    // derives a CONTINUOUS cornering speed from the geometry (distance + how sharply we must turn) and
+    // eases throttle toward it, so bots smoothly slow into every goal and pull a tight, deliberate turn.
     const d = goal.dist;
     const speed = Math.hypot(s.vel.x, s.vel.y, s.vel.z);
-    // Turn radius at the current speed (r = v / omega). Bearing error (1 - aligned) scales how tight a
-    // turn we actually need: a goal dead ahead needs no turn, one off to the side needs the full radius.
-    const turnRadius = speed / FLIGHT_TURN;                 // ~28u at top speed, shrinks as we slow
     const bearingErr = Math.max(0, 1 - aligned);            // 0 = dead ahead, up to 2 = dead behind
-    // The distance at which we must already be slow enough to corner onto the goal. If the goal is
-    // inside (turnRadius * a headroom factor scaled by how much we need to turn), we're going too fast
-    // to make it — scrub speed. Precision (pod grab) needs to actually STOP in a tiny window, so it
-    // demands a much slower final speed; combat/escort points can be taken at a brisker clip.
-    const needFactor = 1.15 + bearingErr * 1.6;             // sharper required turn -> need more room
-    const mustCornerDist = turnRadius * needFactor;
     if (goal.precision) {
       // Pod grab: decelerate INTO the pickup window so the bot settles ON the pod instead of blowing
       // past it. Speed target ramps down with distance; floor kept decisive (not a crawl) so it reads
@@ -236,16 +226,34 @@ export class DemoBots {
       const targetSpeed = d > 380 ? 88 : (24 + (d / 380) * 64);
       if (speed > targetSpeed + 12) { input.thrust = false; input.reverse = speed > targetSpeed + 45; }
       else { input.thrust = true; input.reverse = false; }
-    } else if (d < mustCornerDist && speed > 22) {
-      // Can't make the corner at this speed: cut throttle so drag scrubs speed (and hard-brake if we're
-      // really barreling in and badly off-line), which collapses the turn radius until the bot can pull
-      // its nose onto the goal. As it slows, mustCornerDist shrinks with it, so it re-accelerates the
-      // instant it CAN corner — a tight, decisive turn-in instead of a lazy orbit.
-      input.thrust = false;
-      input.reverse = (bearingErr > 0.6 && speed > 46);
-      input.boost = false;
+    } else {
+      // ---- SPEED-MATCHED-TO-CORNER GOVERNOR -----------------------------------------------------
+      // The loops come from carrying too much speed INTO a close goal: a fighter's turn radius is
+      // r = v/omega, so to actually curve onto a point `d` away while needing to turn through bearing
+      // error `bearingErr`, the bot must already be slow enough that its turn radius fits well inside
+      // that distance. Rather than an on/off brake (which let bots coast wide at moderate bearings), we
+      // compute a CONTINUOUS target speed from the geometry and drive throttle/brake toward it. This
+      // makes bots ease off the gas smoothly as they close on any goal and pull a tight, deliberate
+      // turn-in — objective-driven flight, not lazy orbits.
+      //
+      // Max cornering speed at this distance/bearing: vMax = (d / needFactor) * omega. A dead-ahead
+      // goal (bearingErr~0) needs almost no turn so vMax stays high (fly straight in); a side/behind
+      // goal forces vMax low so the bot slows and turns onto it. Clamped to the hull's sane band.
+      const needFactor = 1.4 + bearingErr * 2.4;             // sharper required turn -> demand more room
+      let vMax = (d / needFactor) * FLIGHT_TURN;
+      vMax = clamp(vMax, 20, 999);                           // never demand a full stop; keep it flying
+      if (speed > vMax + 16) {
+        // Well over the cornering speed: coast (drag scrubs it) or hard-brake if badly off-line and
+        // really barreling in, so the turn radius collapses inside the goal distance fast.
+        input.thrust = false;
+        input.reverse = (bearingErr > 0.5 && speed > vMax + 40);
+        input.boost = false;
+      } else if (speed > vMax) {
+        // Just over: coast down gently, don't brake — keeps momentum while the radius settles.
+        input.thrust = false;
+      }
+      // else at/under cornering speed: keep the default thrust (+ any boost) and bear down on the goal.
     }
-    // else: keep the default (thrust:true + any boost decided above) and bear straight down on the goal.
 
     // Fire control: bolts when a hostile is close and roughly ahead; the odd missile at mid range.
     if (goal.shoot && goal.targetShip) {
@@ -367,13 +375,13 @@ export class DemoBots {
     if (ai.role === 'hunt') {
       const carrier = ai.targetId && room.state.ships.get(ai.targetId);
       if (carrier && carrier.alive && carrier.carrying) {
-        // Lead harder (0.9s vs 0.5s) so hunters cut the carrier off on an intercept line instead of
-        // trailing behind — a boosting carrier should feel genuinely chased down, not politely followed.
-        const lead = this._leadPoint(s, carrier, 0.9);
         const d = this._dist(s.pos, { x: carrier.px, y: carrier.py, z: carrier.pz });
-        // chase:true lets _think boost after a fleeing/boosting carrier even though we also want to
-        // shoot it — so the enemy team genuinely runs down a blue-team human hauling the pod home.
-        return { x: lead.x, y: lead.y, z: lead.z, dist: d, shoot: true, targetShip: carrier, targetId: ai.targetId, chase: true };
+        // Aim for a PURSUIT SLOT, not the carrier's body. Far out we lead its motion to cut it off on
+        // an intercept line; once we're close we aim for a point trailing just behind it along its
+        // heading (its six o'clock) so we SETTLE onto its tail and hold a firing line — instead of
+        // flying into it and looping past. This is the single biggest anti-loop fix for the chase.
+        const aim = this._pursuitPoint(s, carrier, d);
+        return { x: aim.x, y: aim.y, z: aim.z, dist: d, shoot: true, targetShip: carrier, targetId: ai.targetId, chase: true };
       }
       // Carrier gone/dropped it since we last retargeted -> fall through to contest the loose pod.
     }
@@ -435,6 +443,38 @@ export class DemoBots {
   _leadPoint(s, tgt, k) {
     const vx = tgt.vx || 0, vy = tgt.vy || 0, vz = tgt.vz || 0;
     return { x: tgt.px + vx * k, y: tgt.py + vy * k, z: tgt.pz + vz * k };
+  }
+
+  // A PURSUIT-CURVE aim point that makes a chaser settle onto the target's SIX rather than fly into
+  // it and loop. Blends two behaviors by range `d`:
+  //   • FAR (d > ~260): lead the target's motion so we cut it off on an intercept line (close the gap).
+  //   • CLOSE: aim for a point trailing ~65u BEHIND the target along its heading — its six o'clock — so
+  //     we slide into a firing slot and hold station on its tail instead of ramming through it.
+  // If the target is nearly stationary its heading is undefined, so we just aim slightly short of it.
+  _pursuitPoint(s, tgt, d) {
+    const vx = tgt.vx || 0, vy = tgt.vy || 0, vz = tgt.vz || 0;
+    const spd = Math.hypot(vx, vy, vz);
+    if (d > 260) {
+      // Intercept lead scales gently with range so distant chases cut a strong angle without wildly
+      // over-leading a slow target.
+      const k = clamp(d / 400, 0.5, 1.1);
+      return { x: tgt.px + vx * k, y: tgt.py + vy * k, z: tgt.pz + vz * k };
+    }
+    if (spd < 6) {
+      // Target barely moving: aim just short of it so we decelerate onto it rather than through it.
+      const bx = s.pos.x - tgt.px, by = s.pos.y - tgt.py, bz = s.pos.z - tgt.pz;
+      const bl = Math.hypot(bx, by, bz) || 1;
+      return { x: tgt.px + (bx / bl) * 45, y: tgt.py + (by / bl) * 45, z: tgt.pz + (bz / bl) * 45 };
+    }
+    // Trail point: back down the target's heading by ~65u (its six o'clock), plus a touch of lead so
+    // we track a maneuvering target's tail rather than where it just was.
+    const ux = vx / spd, uy = vy / spd, uz = vz / spd;
+    const trail = 65;
+    return {
+      x: tgt.px - ux * trail + vx * 0.25,
+      y: tgt.py - uy * trail + vy * 0.25,
+      z: tgt.pz - uz * trail + vz * 0.25,
+    };
   }
 
   // Build a steering input frame that points the ship's nose toward (tx,ty,tz). Converts the bearing

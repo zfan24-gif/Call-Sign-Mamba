@@ -1195,23 +1195,29 @@ export class ArenaRoom extends Room {
     disk._dropAt = 0;   // server-only: sim time a loose disk auto-returns (unused while home/carried)
   }
 
-  // Drop the disk `sessionId` is carrying (on death, leave, or disconnect). The disk goes loose at
-  // the pilot's last position and starts its auto-return countdown. `killed` distinguishes a combat
-  // drop (a killed carrier) — which fires the disk-lost/disk-returned VO event — from a silent
-  // leave/disconnect drop, which just releases the disk without a callout.
+  // Drop the disk `sessionId` is carrying (on death, leave, or disconnect). In BOTH cases the disk
+  // goes LOOSE at the pilot's last position and starts its stale auto-return countdown — killing the
+  // carrier does NOT teleport the disk home. Per the design here, a friendly must physically TOUCH a
+  // dropped disk to return it, so a kill just knocks it loose to be contested where the carrier died.
+  // `killed` only distinguishes a combat drop (fires the disk-loose/disk-down VO event so both sides
+  // react) from a silent leave/disconnect drop (releases the disk without a callout).
   dropDiskFrom(sessionId, atX, atY, atZ, killed = false) {
     const ship = this.state.ships.get(sessionId);
     if (ship) ship.carrying = false;
     this.state.cargo.forEach((disk) => {
       if (disk.carrier !== sessionId) return;
       disk.carrier = '';
+      // Disk goes LOOSE at the last position and starts its stale auto-return countdown, so a match
+      // can't stall with the disk lost in the void, but until then a teammate must fly over and grab
+      // it to return it home (and an enemy can re-steal it). Same for kills and silent drops.
       disk.atHome = false;
       if (typeof atX === 'number') { disk.px = atX; disk.py = atY; disk.pz = atZ; }
       disk._dropAt = this._now + CDD_DROP_TIMEOUT;
       if (killed) {
-        // The carrier was destroyed: everyone reacts. `diskTeam` = the OWNING team of the dropped disk
-        // (the side whose disk was recovered); `carrierTeam` = the team of the pilot who lost it. The
-        // client VO matrix keys off these to play "our disk returned" vs. "we lost their disk".
+        // Everyone reacts to a combat drop. `diskTeam` = the OWNING team of the loose disk (the side
+        // whose disk is now up for grabs on the field); `carrierTeam` = the team of the pilot who lost
+        // it. The client VO matrix keys off these to play "our disk is loose — go secure it" vs.
+        // "we dropped their disk". The disk is NOT home yet; a friendly must touch it to return it.
         this.broadcast('diskDrop', {
           diskTeam: disk.team,
           carrierTeam: ship ? ship.team : -1,
@@ -1254,6 +1260,30 @@ export class ArenaRoom extends Room {
           if (ownDisk && ownDisk.atHome) this.scoreDiskCapture(carrier, disk);
         }
         return;
+      }
+
+      // --- LOOSE disk: a friendly (same-team) pilot flying within pickup range RETURNS it home ------
+      // CTF convention: your own disk can't be carried, but if it's been knocked LOOSE on the field
+      // (dropped by a killed thief), any teammate can fly over and touch it to snap it back home. A
+      // disk that's safely at home isn't "returnable" (nothing to do), so we only check loose disks.
+      if (!disk.atHome) {
+        let returned = false;
+        const returnR2 = CDD_PICKUP_RADIUS * CDD_PICKUP_RADIUS;
+        this.state.ships.forEach((ship, sid) => {
+          if (returned || !ship.alive) return;
+          if (ship.team !== ownerTeam) return;       // only the OWNING team returns their own disk
+          const s = this.sim.get(sid);
+          if (!s) return;
+          const dx = s.pos.x - disk.px, dy = s.pos.y - disk.py, dz = s.pos.z - disk.pz;
+          if (dx * dx + dy * dy + dz * dz <= returnR2) returned = true;
+        });
+        if (returned) {
+          this.resetDiskHome(disk);
+          // Owners hear "disk secured / back home"; the far team just sees it reset. Reuse the diskDrop
+          // VO channel with diskTeam = the returned disk's owning team and carrierTeam = -1 (no thief).
+          this.broadcast('diskReturn', { diskTeam: ownerTeam });
+          return;
+        }
       }
 
       // --- Home or loose disk: the nearest eligible ENEMY pilot within pickup range grabs it -------
