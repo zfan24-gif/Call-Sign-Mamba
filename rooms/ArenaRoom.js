@@ -140,6 +140,17 @@ const CTC_BASE_SPREAD = 3.2;       // ~735u apart at 1.0 -> ~2350u apart at 3.2
 // A pod dropped in space auto-returns to CENTER after this many seconds untouched, so a match can't
 // stall with the flag lost in the void nobody reclaims.
 const CARGO_DROP_TIMEOUT = 25;     // seconds a loose pod floats before auto-returning to center
+
+// --- Capture the Data Disk (CDD) settings ------------------------------------------------------
+// A TRUE capture-the-flag variant with TWO team-owned data disks. Each team's disk rests at a fixed
+// CAPTURE SPOT hovering just above its OWN capital ship. To score, a pilot steals the ENEMY team's
+// disk from that spot and returns it to their OWN disk's spot (their home). A disk can only be
+// grabbed while home OR while loose (dropped by a killed carrier); it auto-returns home after a stale
+// timeout. A pilot may only carry ONE disk at a time. Reuses the CTC base spread + capture-radius
+// machinery; the disks key 'blueDisk'/'redDisk' in state.cargo with team = the OWNING team.
+const CDD_DISK_HOME_HEIGHT = 60;   // units the capture spot hovers ABOVE the owning team's base center
+const CDD_PICKUP_RADIUS = 26;      // units a pilot must be within of a home/loose disk to grab it
+const CDD_DROP_TIMEOUT = 25;       // seconds a dropped disk floats before auto-returning to its home
 // Solid-capital collision: ships cannot fly THROUGH a base. Any ship whose center comes within this
 // radius of a base center is pushed back out to the surface (and its inward velocity killed).
 // PER-TEAM sizes: the two capitals are DIFFERENT hulls with very different lengths — the blue
@@ -286,9 +297,10 @@ export class ArenaRoom extends Room {
       if (client.sessionId !== this.state.host) return;      // only the host configures
       if (this.state.matchState !== 'lobby') return;          // no reconfiguring a live/ended round
       if (!msg) return;
-      // Whitelist the mode: Squadron Death Match (teams), Free-For-All (every-man-for-himself), or
-      // Capture the Cargo (team capture-the-flag). Anything else is ignored.
-      if (msg.mode === 'sdm' || msg.mode === 'ffa' || msg.mode === 'ctc') this.state.mode = msg.mode;
+      // Whitelist the mode: Squadron Death Match (teams), Free-For-All (every-man-for-himself),
+      // Capture the Cargo (single neutral flag), or Capture the Data Disk (dual team disks, true CTF).
+      // Anything else is ignored.
+      if (msg.mode === 'sdm' || msg.mode === 'ffa' || msg.mode === 'ctc' || msg.mode === 'cdd') this.state.mode = msg.mode;
       // DEMO-ONLY (REMOVE BEFORE SHIP): arm the AI squadron when the host selects CTC in the lobby,
       // and tear it down if they switch back to another mode so SDM/FFA stay pure-human.
       this.maybeArmDemoBots();
@@ -393,16 +405,24 @@ export class ArenaRoom extends Room {
   // anchors, and team-vs-team scoring all switch off in FFA.
   isFFA() { return this.state.mode === 'ffa'; }
 
-  // True while this room is running Capture the Cargo (team capture-the-flag). Gates all cargo
+  // True while this room is running Capture the Cargo (single neutral flag). Gates the single-pod
   // pickup/carry/capture logic and the capture-based win condition.
   isCTC() { return this.state.mode === 'ctc'; }
+
+  // True while this room is running Capture the Data Disk (dual team-owned disks, true CTF).
+  isCDD() { return this.state.mode === 'cdd'; }
+
+  // True for EITHER capture mode (CTC or CDD). Both share the same base spread, solid-capital
+  // collisions, base-anchored respawns, and capture-based win condition — only the cargo simulation
+  // itself differs (one neutral pod vs. two team disks), so all the shared plumbing gates on this.
+  isCargoMode() { return this.isCTC() || this.isCDD(); }
 
   // The world-space capital base center for a team. In CTC the base is pushed far out along the
   // spawn-anchor direction (CTC_BASE_SPREAD) so the two capitals sit a long haul apart; in SDM/FFA
   // this is just the raw spawn anchor.
   baseCenter(team) {
     const sp = SPAWN[team] || SPAWN[0];
-    const k = this.isCTC() ? CTC_BASE_SPREAD : 1;
+    const k = this.isCargoMode() ? CTC_BASE_SPREAD : 1;
     return { x: sp.pos[0] * k, y: sp.pos[1] * k, z: sp.pos[2] * k };
   }
 
@@ -433,8 +453,8 @@ export class ArenaRoom extends Room {
   // clear() both self-guard against redundant calls).
   maybeArmDemoBots() {
     if (!this.demoBots) return;
-    if (this.isCTC() && this.state.matchState === 'lobby') this.demoBots.arm();
-    else if (!this.isCTC()) this.demoBots.clear();
+    if (this.isCargoMode() && this.state.matchState === 'lobby') this.demoBots.arm();
+    else if (!this.isCargoMode()) this.demoBots.clear();
   }
 
   onJoin(client, options) {
@@ -533,9 +553,10 @@ export class ArenaRoom extends Room {
   removeShip(sessionId) {
     const ship = this.state.ships.get(sessionId);
     if (!ship) { this.sim.delete(sessionId); return; }
-    // Capture the Cargo: if this pilot was carrying a pod, drop it loose at their last position so a
-    // rage-quit/disconnect can't carry the flag out of the match — the fight for it continues.
+    // Capture modes: if this pilot was carrying cargo/a disk, drop it loose at their last position so
+    // a rage-quit/disconnect can't carry the flag out of the match — the fight for it continues.
     if (this.isCTC() && ship.carrying) this.dropCargoFrom(sessionId, ship.px, ship.py, ship.pz);
+    else if (this.isCDD() && ship.carrying) this.dropDiskFrom(sessionId, ship.px, ship.py, ship.pz, false);
     if (ship.team === 0) this.state.blueCount = Math.max(0, this.state.blueCount - 1);
     else this.state.redCount = Math.max(0, this.state.redCount - 1);
     this.state.ships.delete(sessionId);
@@ -676,8 +697,8 @@ export class ArenaRoom extends Room {
     // --- 1b) Ship-to-ship hull collisions -----------------------------------------------------
     this.resolveShipCollisions();
 
-    // --- 1c) Capital-base collisions (CTC only): bases are SOLID, ships can't fly through them --
-    if (this.isCTC()) this.resolveBaseCollisions();
+    // --- 1c) Capital-base collisions (cargo modes only): bases are SOLID, ships can't fly through --
+    if (this.isCargoMode()) this.resolveBaseCollisions();
 
     // --- 2) Bolts: advance and hit-detect -----------------------------------------------------
     this.advanceBolts();
@@ -685,8 +706,9 @@ export class ArenaRoom extends Room {
     // --- 3) Missiles: home toward their locked target, advance, and proximity-fuse -------------
     this.advanceMissiles();
 
-    // --- 4) Capture the Cargo: pickups, carrier tracking, returns, and captures ---------------
+    // --- 4) Capture modes: pickups, carrier tracking, returns, and captures -------------------
     if (this.state.matchState === 'live' && this.isCTC()) this.advanceCargo();
+    else if (this.state.matchState === 'live' && this.isCDD()) this.advanceDisks();
   }
 
   // Authoritative ship-to-ship hull collisions. All-pairs sweep over LIVE ships (fine at 24 players):
@@ -1115,6 +1137,167 @@ export class ArenaRoom extends Room {
     return '';
   }
 
+  // ---- Capture the Data Disk (CDD) -------------------------------------------------------------
+
+  // The fixed CAPTURE SPOT for a team's disk: a point hovering CDD_DISK_HOME_HEIGHT units directly
+  // above that team's capital base center. This is both the disk's home rest position AND the spot a
+  // carrier must reach to score (they return the ENEMY disk to THEIR OWN disk's spot).
+  diskHome(team) {
+    const b = this.baseCenter(team);
+    return { x: b.x, y: b.y + CDD_DISK_HOME_HEIGHT, z: b.z };
+  }
+
+  // Spawn BOTH team disks at their capture spots. Called once when a CDD match starts. Each disk's
+  // `team` is the OWNING team (0 = blue disk, 1 = red disk); its home is replicated so the client can
+  // render the spinning capture marker at the exact authoritative point even while the disk is stolen.
+  setupDisks() {
+    this.clearCargo();
+    for (const team of [0, 1]) {
+      const disk = new Cargo();
+      disk.team = team;                 // OWNING team (blue disk / red disk)
+      disk.modelIndex = team;           // 0 -> blue GLB, 1 -> red GLB (client maps this to the disk model)
+      const h = this.diskHome(team);
+      disk.homeX = h.x; disk.homeY = h.y; disk.homeZ = h.z;
+      this.resetDiskHome(disk);
+      this.state.cargo.set(team === 0 ? 'blueDisk' : 'redDisk', disk);
+    }
+  }
+
+  // Park a disk back at its own capture spot (carrier/loose flags cleared). Used at spawn, after a
+  // capture, and on a stale auto-return.
+  resetDiskHome(disk) {
+    disk.px = disk.homeX; disk.py = disk.homeY; disk.pz = disk.homeZ;
+    disk.carrier = '';
+    disk.atHome = true;
+    disk._dropAt = 0;   // server-only: sim time a loose disk auto-returns (unused while home/carried)
+  }
+
+  // Drop the disk `sessionId` is carrying (on death, leave, or disconnect). The disk goes loose at
+  // the pilot's last position and starts its auto-return countdown. `killed` distinguishes a combat
+  // drop (a killed carrier) — which fires the disk-lost/disk-returned VO event — from a silent
+  // leave/disconnect drop, which just releases the disk without a callout.
+  dropDiskFrom(sessionId, atX, atY, atZ, killed = false) {
+    const ship = this.state.ships.get(sessionId);
+    if (ship) ship.carrying = false;
+    this.state.cargo.forEach((disk) => {
+      if (disk.carrier !== sessionId) return;
+      disk.carrier = '';
+      disk.atHome = false;
+      if (typeof atX === 'number') { disk.px = atX; disk.py = atY; disk.pz = atZ; }
+      disk._dropAt = this._now + CDD_DROP_TIMEOUT;
+      if (killed) {
+        // The carrier was destroyed: everyone reacts. `diskTeam` = the OWNING team of the dropped disk
+        // (the side whose disk was recovered); `carrierTeam` = the team of the pilot who lost it. The
+        // client VO matrix keys off these to play "our disk returned" vs. "we lost their disk".
+        this.broadcast('diskDrop', {
+          diskTeam: disk.team,
+          carrierTeam: ship ? ship.team : -1,
+          carrier: sessionId,
+          carrierName: ship ? ship.name : '',
+        });
+      }
+    });
+  }
+
+  // One CDD tick over BOTH team disks: ride a carrier + check for a score at the carrier's OWN disk
+  // spot; else let the nearest ELIGIBLE enemy pilot grab a home/loose disk; else auto-return a stale
+  // drop. A pilot may only ever carry ONE disk (guarded by ship.carrying), and can only steal the
+  // ENEMY team's disk (never their own). Called only when the match is LIVE and the mode is CDD.
+  advanceDisks() {
+    this.state.cargo.forEach((disk) => {
+      const ownerTeam = disk.team;   // 0 = blue disk, 1 = red disk
+
+      // --- Carried: ride the carrier and check for a score at the carrier's OWN disk spot ---------
+      if (disk.carrier) {
+        const carrier = this.state.ships.get(disk.carrier);
+        const cs = this.sim.get(disk.carrier);
+        if (!carrier || !carrier.alive || !cs) {
+          // Carrier vanished without a clean drop (edge case) — drop at last known disk position.
+          this.dropDiskFrom(disk.carrier, disk.px, disk.py, disk.pz, false);
+          return;
+        }
+        disk.px = cs.pos.x; disk.py = cs.pos.y; disk.pz = cs.pos.z;
+        disk.atHome = false;
+        // SCORE check: the carrier reaches within CDD_PICKUP_RADIUS of THEIR OWN disk's capture spot.
+        // (You steal the enemy disk and return it to where your own disk lives.) A carrier can only
+        // hold the ENEMY disk, so the carrier's own team spot is diskHome(carrier.team).
+        const spot = this.diskHome(carrier.team);
+        const dx = cs.pos.x - spot.x, dy = cs.pos.y - spot.y, dz = cs.pos.z - spot.z;
+        if (dx * dx + dy * dy + dz * dz <= CDD_PICKUP_RADIUS * CDD_PICKUP_RADIUS) {
+          // Only a valid capture if the carrier's OWN disk is safely home — classic CTF: you can't
+          // score while your own disk is stolen/adrift. If it isn't home, the return is denied this
+          // tick (the carrier keeps holding the enemy disk until their own is recovered).
+          const ownDisk = this.state.cargo.get(carrier.team === 0 ? 'blueDisk' : 'redDisk');
+          if (ownDisk && ownDisk.atHome) this.scoreDiskCapture(carrier, disk);
+        }
+        return;
+      }
+
+      // --- Home or loose disk: the nearest eligible ENEMY pilot within pickup range grabs it -------
+      let claimedBy = null, nearestPickup = CDD_PICKUP_RADIUS * CDD_PICKUP_RADIUS;
+      this.state.ships.forEach((ship, sid) => {
+        if (!ship.alive || ship.carrying) return;    // one disk per pilot
+        if (ship.team === ownerTeam) return;         // you cannot pick up your OWN team's disk
+        const s = this.sim.get(sid);
+        if (!s) return;
+        const dx = s.pos.x - disk.px, dy = s.pos.y - disk.py, dz = s.pos.z - disk.pz;
+        const d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 <= nearestPickup) { nearestPickup = d2; claimedBy = sid; }
+      });
+
+      if (claimedBy) {
+        const grabber = this.state.ships.get(claimedBy);
+        if (grabber) grabber.carrying = true;
+        disk.carrier = claimedBy;
+        disk.atHome = false;
+        // Broadcast a 'diskPickup' so every client can run the VO matrix. `diskTeam` = the OWNING team
+        // of the stolen disk; `carrierTeam` = the grabbing pilot's team (the thief).
+        this.broadcast('diskPickup', {
+          diskTeam: ownerTeam,
+          carrierTeam: grabber ? grabber.team : -1,
+          carrier: claimedBy,
+          carrierName: grabber ? grabber.name : '',
+        });
+        return;
+      }
+      // Auto-return a stale loose disk to its home spot so a lost disk can't stall the match.
+      if (!disk.atHome && disk._dropAt && this._now >= disk._dropAt) this.resetDiskHome(disk);
+    });
+  }
+
+  // Award a CDD capture to the carrier's team, reset the STOLEN disk to its own home, and end the
+  // match if the team reached the capture target. Broadcasts both the shared 'capture' event (so the
+  // existing HUD banner/score feedback works unchanged) and a 'diskCapture' event carrying the disk
+  // allegiance for the CDD score VO matrix.
+  scoreDiskCapture(carrier, disk) {
+    const team = carrier.team;
+    if (team === 0) this.state.blueCaptures = (this.state.blueCaptures + 1) & 0xffff;
+    else this.state.redCaptures = (this.state.redCaptures + 1) & 0xffff;
+    carrier.carrying = false;
+    this.resetDiskHome(disk);   // the recovered/stolen enemy disk snaps back to ITS own home spot
+    const carrierId = this.sessionIdOf(carrier);
+    // Shared capture event (drives the generic HUD capture banner + running score, same as CTC).
+    this.broadcast('capture', {
+      team,
+      carrier: carrierId,
+      carrierName: carrier.name,
+      podTeam: disk.team,
+      blueCaptures: this.state.blueCaptures,
+      redCaptures: this.state.redCaptures,
+    });
+    // CDD-specific score event for the faction VO matrix: `scoringTeam` returned `diskTeam`'s disk.
+    this.broadcast('diskCapture', {
+      scoringTeam: team,
+      diskTeam: disk.team,
+      carrier: carrierId,
+      carrierName: carrier.name,
+      blueCaptures: this.state.blueCaptures,
+      redCaptures: this.state.redCaptures,
+    });
+    const scored = team === 0 ? this.state.blueCaptures : this.state.redCaptures;
+    if (scored >= this.state.captureTarget) this.endMatch();
+  }
+
   // Apply damage to a ship: shields absorb first, then hull. Credits a kill on destruction.
   // Broadcasts a 'hit' event so BOTH the shooter (hit-marker "you connected") and the victim
   // (damage flash / "you're taking fire") get immediate feedback, independent of the kill event.
@@ -1145,9 +1328,11 @@ export class ArenaRoom extends Room {
     ship.hull = 0;
     ship.shields = 0;
     ship.speaking = false;   // a destroyed pilot drops off the radio until they respawn
-    // Capture the Cargo: a destroyed carrier DROPS the pod where they died — killing the flag runner
-    // is the primary way to stop a capture, so the pod goes loose right there for the fight over it.
+    // Capture modes: a destroyed carrier DROPS whatever they hauled where they died — killing the
+    // flag/disk runner is the primary way to stop a capture, so it goes loose right there.
     if (this.isCTC() && ship.carrying) this.dropCargoFrom(sid, ship.px, ship.py, ship.pz);
+    // CDD: dropping via a KILL fires the disk-lost/disk-returned VO event (see dropDiskFrom killed=true).
+    else if (this.isCDD() && ship.carrying) this.dropDiskFrom(sid, ship.px, ship.py, ship.pz, true);
     ship.deaths = (ship.deaths + 1) & 0xffff;
     ship.respawnIn = RESPAWN_DELAY;                          // seed the replicated countdown immediately
     ship.lastKiller = (attackerId && attackerId !== sid) ? attackerId : '';   // for the client kill-cam framing
@@ -1191,7 +1376,7 @@ export class ArenaRoom extends Room {
     // In CTC, anchor spawns to the (spread) team BASE so pilots warp in near their capital and
     // naturally defend it; in SDM the raw spawn anchor is used.
     let ax, ay, az;
-    if (this.isCTC()) {
+    if (this.isCargoMode()) {
       const b = this.baseCenter(team);
       ax = b.x; ay = b.y; az = b.z;
     } else {
@@ -1382,9 +1567,11 @@ export class ArenaRoom extends Room {
       const s = this.sim.get(sid);
       if (s) this.respawnShip(sid, ship, s);
     }
-    // Capture the Cargo: spawn both team pods at home. Other modes clear any stale pods so nothing
-    // renders (SDM/FFA have no cargo).
-    if (this.isCTC()) this.setupCargo(); else this.clearCargo();
+    // Capture modes: spawn the flag/disks at home. CTC = one neutral pod at center; CDD = two team
+    // disks at their capture spots. Other modes clear any stale cargo so nothing renders.
+    if (this.isCTC()) this.setupCargo();
+    else if (this.isCDD()) this.setupDisks();
+    else this.clearCargo();
     this.broadcast('matchStart', {
       roundDuration: this.state.roundDuration,
       mode: this.state.mode,
@@ -1422,19 +1609,19 @@ export class ArenaRoom extends Room {
       return;
     }
 
-    if (this.isCTC()) {
-      // Capture the Cargo: the team with more captures wins (either by hitting the target early —
+    if (this.isCargoMode()) {
+      // Capture modes (CTC + CDD): the team with more captures wins (by hitting the target early —
       // scoreCapture calls endMatch — or by leading when the clock runs out). Equal captures = draw.
       const bc = this.state.blueCaptures, rc = this.state.redCaptures;
       this.state.winningTeam = bc > rc ? 0 : rc > bc ? 1 : -1;
-      this.clearCargo();   // pull the pods once the round is decided
+      this.clearCargo();   // pull the flag/disks once the round is decided
       this.broadcast('matchEnd', {
-        mode: 'ctc',
+        mode: this.state.mode,
         winningTeam: this.state.winningTeam,
         blueCaptures: bc, redCaptures: rc,
         captureTarget: this.state.captureTarget,
       });
-      console.log(`[arena] CTC MATCH END — BLUE ${bc} : ${rc} RED -> winner=${this.state.winningTeam === -1 ? 'DRAW' : this.state.winningTeam === 0 ? 'BLUE' : 'RED'} [roomId=${this.roomId}]`);
+      console.log(`[arena] ${this.state.mode.toUpperCase()} MATCH END — BLUE ${bc} : ${rc} RED -> winner=${this.state.winningTeam === -1 ? 'DRAW' : this.state.winningTeam === 0 ? 'BLUE' : 'RED'} [roomId=${this.roomId}]`);
       return;
     }
 

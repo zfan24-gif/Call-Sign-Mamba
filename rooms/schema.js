@@ -106,11 +106,16 @@ defineTypes(Ship, {
 export class Cargo extends Schema {
   constructor() {
     super();
-    this.team = 2;            // 2 = NEUTRAL (contested by both teams); the single flag has no owner
-    this.px = 0; this.py = 0; this.pz = 0;   // world position (center home, dropped, or carrier-tracked)
-    this.carrier = '';        // sessionId of the pilot carrying it ('' = loose or at center)
-    this.atHome = true;       // true when resting at center (not carried, not dropped adrift)
-    this.modelIndex = 0;      // which container GLB variant to render (randomized each round)
+    this.team = 2;            // CTC: 2 = NEUTRAL (contested). CDD: 0 = blue disk, 1 = red disk (the OWNING team).
+    this.px = 0; this.py = 0; this.pz = 0;   // world position (home, dropped, or carrier-tracked)
+    this.carrier = '';        // sessionId of the pilot carrying it ('' = loose or at home)
+    this.atHome = true;       // true when resting at its home spot (not carried, not dropped adrift)
+    this.modelIndex = 0;      // which container GLB variant to render (CTC only; CDD renders the fixed disk GLB)
+    // --- Capture the Data Disk (CDD) only ---
+    // Each disk has a FIXED home = the capture spot hovering above its owning team's capital. The
+    // client renders a spinning disk marker there and needs the authoritative point, so we replicate
+    // it (it never moves within a match). Unused/zero in CTC (the single pod's home is arena center).
+    this.homeX = 0; this.homeY = 0; this.homeZ = 0;
   }
 }
 defineTypes(Cargo, {
@@ -119,6 +124,7 @@ defineTypes(Cargo, {
   carrier: 'string',
   atHome: 'boolean',
   modelIndex: 'uint8',
+  homeX: 'float32', homeY: 'float32', homeZ: 'float32',
 });
 
 // One networked laser bolt. Spawned authoritatively when a client sends a valid 'fire' intent, then

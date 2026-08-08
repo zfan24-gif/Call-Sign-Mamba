@@ -36,18 +36,24 @@ const JOIN_FIRST_MS = 900;      // first bot joins shortly after the human opens
 const READY_AFTER_JOIN_MS = 1400;   // a bot readies up this long after it has joined (staggered per-bot)
 const READY_JITTER_MS = 1600;       // extra random spread so ready pips never pop in lockstep
 
-// --- AI tuning (video-grade, deliberately beatable) -------------------------------------------
-const BOT_FIRE_RANGE = 340;        // only shoot when the target is within this and roughly ahead
-const BOT_FIRE_CONE = 0.965;       // dot(nose, toTarget) must exceed this to pull the trigger
-const BOT_FIRE_CHANCE = 0.55;      // per-eligible-tick chance to actually fire (keeps it human-ish)
-const BOT_MISSILE_RANGE = 900;     // launch a missile when locked-ish within this
-const BOT_MISSILE_COOLDOWN = 7.5;  // seconds between a bot's missiles (on top of the room's own cap)
-const BOT_MISSILE_CHANCE = 0.02;   // low per-tick chance so missiles are an occasional spike
-const BOT_BOOST_RANGE = 520;       // boost to close the gap when the target is beyond this
+// --- AI tuning (assertive but still beatable) -------------------------------------------------
+// Dialed UP from the old "video-grade, deliberately timid" values: bots now shoot more often, from a
+// slightly wider cone and longer range, throw more missiles, and commit harder to the objective — so
+// CTC actually feels contested. Aim jitter (below) is what keeps them beatable: they miss enough that
+// a competent human wins, but they land real hits and press the pod instead of loitering.
+const BOT_FIRE_RANGE = 420;        // only shoot when the target is within this and roughly ahead
+const BOT_FIRE_CONE = 0.94;        // dot(nose, toTarget) must exceed this to pull the trigger (wider = more shots)
+const BOT_FIRE_CHANCE = 0.82;      // per-eligible-tick chance to actually fire (was 0.55 — far more trigger pulls)
+const BOT_MISSILE_RANGE = 1050;    // launch a missile when locked-ish within this
+const BOT_MISSILE_COOLDOWN = 5.0;  // seconds between a bot's missiles (on top of the room's own cap)
+const BOT_MISSILE_CHANCE = 0.05;   // per-tick chance a missile spikes out (was 0.02)
+const BOT_BOOST_RANGE = 460;       // boost to close the gap when the target is beyond this (closes sooner)
 const BOT_ENGAGE_RANGE = 1400;     // beyond this a bot regroups toward the objective instead of dogfighting
-const BOT_REACT_JITTER = 0.05;     // small steering imperfection so aim isn't robotic (kept low so it
-                                   // adds life without preventing the bot from settling on target)
-const BOT_RETARGET_SEC = 1.1;      // how often a bot re-evaluates its target/intent
+const BOT_REACT_JITTER = 0.05;     // steering imperfection so aim isn't robotic. Bumped up to keep the now
+                                   // more-accurate/aggressive bots BEATABLE — this is the main difficulty
+                                   // dial. Small enough that bots still hold a clean line to the goal, big
+                                   // enough that their bolts scatter and a sharp human can out-fly them.
+const BOT_RETARGET_SEC = 0.8;      // how often a bot re-evaluates its target/intent (snappier reactions)
 
 export class DemoBots {
   constructor(room) {
@@ -182,11 +188,6 @@ export class DemoBots {
       ai.jitterX = (Math.random() * 2 - 1) * BOT_REACT_JITTER;
       ai.jitterY = (Math.random() * 2 - 1) * BOT_REACT_JITTER;
     }
-    // Slowly drift this bot's staging slot so loitering escorts/contesters sweep a WIDE arc around
-    // their objective instead of fixating on one point they endlessly overshoot (which reads as a
-    // tight loop). Slow enough (~0.1 rad/s) that they still hold station near the cargo/carrier.
-    ai.slot += 0.0035;
-
     // Resolve a world-space GOAL point to fly toward + whether it's a ship to shoot.
     const goal = this._goalPoint(sid, ai, s, ship);
     const input = this._steerToward(s, goal.x, goal.y, goal.z, ai);
@@ -197,7 +198,10 @@ export class DemoBots {
     // flag CARRIER we boost even at range so pursuers can actually run down a boosting carrier —
     // otherwise the carrier just outruns everyone and it stops looking like a real chase.
     const chasingCarrier = goal.chase && goal.dist > BOT_BOOST_RANGE;
-    input.boost = (chasingCarrier || (goal.dist > BOT_BOOST_RANGE && !goal.shoot)) && !goal.precision;
+    // A carrying bot boosts nearly the whole way home (until it's basically at the base) so a capture
+    // run has real urgency; otherwise boost only to close big gaps and not while lined up for a shot.
+    const runningHome = goal.runHome && goal.dist > 120;
+    input.boost = (runningHome || chasingCarrier || (goal.dist > BOT_BOOST_RANGE && !goal.shoot)) && !goal.precision;
 
     // PRECISION APPROACH to the pod (grab): a fighter can't stop, and at ~74 u/s it clears the 22u
     // pickup window in ~0.3s — a full-speed pass almost always MISSES and the bot loops back forever.
@@ -206,28 +210,49 @@ export class DemoBots {
     if (goal.precision) {
       input.boost = false;
       const d = goal.dist;
-      if (d > 220) {
-        // Far out: bear straight down on the pod at full thrust (default). Allow a light boost when
-        // it's a long way off so the whole team actually converges on the objective quickly.
-        input.thrust = true; input.reverse = false;
-        input.boost = d > 640;
-      } else if (aligned < 0.2) {
-        // Genuinely pointed the WRONG way (pod off to the side/behind): ease off the throttle just
-        // enough to whip the nose back onto it, then re-commit. We only bleed speed when badly out of
-        // alignment now — not at the old 0.55 cutoff, which had bots coasting to a crawl on every
-        // approach and drifting past the tiny window (the root of the "circles near the pod" look).
-        input.thrust = false; input.reverse = false;
-      } else if (d > 70) {
-        // Closing and roughly lined up: keep DRIVING toward the pod. Momentum carries a fighter into
-        // the 22u window far more reliably than the old timid coast did.
-        input.thrust = true; input.reverse = false;
+      const speed = Math.hypot(s.vel.x, s.vel.y, s.vel.z);
+      // ROOT CAUSE of the loops: at full speed (74 u/s) with a 2.6 rad/s turn rate, a fighter's
+      // minimum turn radius (~28u) is BIGGER than the 22u pickup window — so a fast bot literally
+      // cannot turn tight enough to stay on the pod and orbits it forever. The fix is a hard SPEED
+      // LIMIT that shrinks with distance: far out we may run fast to close, but as we near the pod we
+      // force the bot slow so its turn radius collapses well inside the window and it can settle ON it.
+      // Commit HARDER than before: run in fast from range, and only slow to a still-decisive speed in
+      // the final pocket (not a ~10 u/s crawl, which read as loitering). Higher floor = bots snatch the
+      // pod with intent while the ramp still shrinks the turn radius enough to actually connect.
+      //   >380u: full approach speed; 380->0u: target speed ramps 90 -> ~26 u/s
+      const targetSpeed = d > 380 ? 90 : (26 + (d / 380) * 64);
+      if (aligned < 0.3 && d < 160) {
+        // Badly pointed away from the pod up CLOSE: stop thrusting and let drag scrub speed while we
+        // pivot hard onto it (tiny radius). Only in the tight pocket where a wide arc would miss.
+        input.thrust = false; input.reverse = speed > targetSpeed * 1.5;
+      } else if (speed > targetSpeed + 30) {
+        // Well over our distance-appropriate speed: coast down so the turn radius stays inside the
+        // window. Looser threshold than before so bots keep their momentum and drive the grab home.
+        input.thrust = false; input.reverse = speed > targetSpeed + 60;
       } else {
-        // Final pocket (<70u), lined up: feather so we settle INTO the window instead of blasting
-        // through it. If we've actually overshot (pod now behind us), reverse-brake hard to kill
-        // velocity and swing back TIGHT rather than arcing out into a wide loop.
-        if (aligned < 0) { input.thrust = false; input.reverse = true; }
-        else { input.thrust = d > 34; input.reverse = false; }
+        // At/near target speed: keep thrusting toward the pod. Committing beats feathering — a bot that
+        // keeps its nose on the pod and its throttle up looks like it WANTS the flag.
+        input.thrust = true; input.reverse = false;
       }
+    } else {
+      // UNIVERSAL ANTI-ORBIT GOVERNOR (all non-precision goals: contest / escort / hunt). Same physics
+      // truth as the pod approach — a fighter's turn radius at full speed is far larger than the small
+      // points these roles fly to, so a fast bot that's slightly off-target circles it. The fix: near a
+      // goal, only run fast when it's actually IN FRONT of us; if it's off to the side/behind, cut
+      // throttle (brake if we're really moving) so we slow down, turn tight ONTO it, then re-accelerate.
+      // This is what stops the "loop de loops" everywhere, not just at the pod.
+      const d = goal.dist;
+      const speed = Math.hypot(s.vel.x, s.vel.y, s.vel.z);
+      // Tighter braking window than before (180u & aligned<0.4, was 260u & 0.6): bots now only scrub
+      // speed when they're genuinely about to overshoot a close point pointed the wrong way. In a
+      // dogfight that means they keep PRESSING the target instead of constantly coasting — which is
+      // what read as "sheepish looping." A hostile that's roughly ahead gets bored down on, not braked.
+      if (d < 180 && aligned < 0.4) {
+        input.thrust = false;
+        input.reverse = speed > 55;
+        input.boost = false;
+      }
+      // Otherwise keep the default (thrust:true, plus any boost decided above) and bear down on the goal.
     }
 
     // Fire control: bolts when a hostile is close and roughly ahead; the odd missile at mid range.
@@ -264,10 +289,28 @@ export class DemoBots {
   // The role also carries the engagement target so _think knows who to shoot. Result: the flag is the
   // gravity well of the match — exactly the "everyone's going for / defending / attacking the cargo"
   // read you want, and the human is always surrounded by pilots who clearly care about the pod.
+  // The cargo object this bot should treat as its objective this tick. In CTC there is one neutral
+  // 'flag'. In CDD there are TWO team disks: a bot's team STEALS the enemy disk and DEFENDS its own.
+  // Priority: if OUR disk has been stolen/knocked loose, that's the emergency (defend/recover it);
+  // otherwise go after the ENEMY disk (steal it). This lets the shared role logic below stay intact.
+  _objectiveFlag(team) {
+    const room = this.room;
+    const cargo = room.state.cargo;
+    if (!cargo) return null;
+    if (!room.isCDD || !room.isCDD()) return cargo.get('flag');
+    const ownKey = team === 0 ? 'blueDisk' : 'redDisk';
+    const enemyKey = team === 0 ? 'redDisk' : 'blueDisk';
+    const own = cargo.get(ownKey), enemy = cargo.get(enemyKey);
+    // Our disk in enemy hands or adrift -> make recovering it the priority objective.
+    if (own && (own.carrier || !own.atHome)) return own;
+    // Otherwise focus the enemy disk (steal it / hunt whoever grabbed it).
+    return enemy || own || null;
+  }
+
   _assignRole(sid, ai, s, ship) {
     const room = this.room;
     const team = ship.team;
-    const flag = room.state.cargo && room.state.cargo.get('flag');
+    const flag = this._objectiveFlag(team);
 
     // I'm the carrier: my role is fixed (run it home) — handled in _goalPoint, but note it here.
     if (ship.carrying) { ai.role = 'carry'; ai.targetId = ''; return; }
@@ -294,11 +337,11 @@ export class DemoBots {
     // nearby so both squadrons swarm the objective and the human always has bodies around it.
     if (flag) {
       const fp = { x: flag.px, y: flag.py, z: flag.pz };
-      // STICKY final approach: once I'm inside 140u of a loose pod I stay committed to the grab even
+      // STICKY final approach: once I'm inside 170u of a loose pod I stay committed to the grab even
       // if a teammate momentarily edges closer — otherwise a role flip mid-pocket jerks my goal point
       // and I peel off into exactly the loop we're trying to kill. Finish the run.
-      const nearPod = this._dist(s.pos, fp) < 140;
-      ai.role = (nearPod || this._amClosestFew(sid, team, fp, 5)) ? 'grab' : 'contest';   // most of the team commits to the grab run
+      const nearPod = this._dist(s.pos, fp) < 170;
+      ai.role = (nearPod || this._amClosestFew(sid, team, fp, 6)) ? 'grab' : 'contest';   // most of the team commits to the grab run
       // While contesting, a bot still shoots any enemy that strays close to it near the pod.
       ai.targetId = this._nearestHostile(s, team) || '';
       return;
@@ -315,12 +358,15 @@ export class DemoBots {
   _goalPoint(sid, ai, s, ship) {
     const room = this.room;
     const team = ship.team;
-    const flag = room.state.cargo && room.state.cargo.get('flag');
+    const flag = this._objectiveFlag(team);
 
-    // CARRY: I have the pod -> beeline for my own base (this is what actually scores captures).
+    // CARRY: I have the pod/disk -> beeline HARD for the score point (this is what captures). In CTC
+    // that's my base center; in CDD it's my OWN disk's capture spot (return the enemy disk to it).
+    // `runHome` tells _think to hold boost the whole way so a carrying bot drives for the score with
+    // real urgency instead of ambling home — the human has to actively intercept it.
     if (ship.carrying) {
-      const home = room.baseCenter(team);
-      return { x: home.x, y: home.y, z: home.z, dist: this._dist(s.pos, home), shoot: false, targetShip: null, targetId: '' };
+      const home = (room.isCDD && room.isCDD()) ? room.diskHome(team) : room.baseCenter(team);
+      return { x: home.x, y: home.y, z: home.z, dist: this._dist(s.pos, home), shoot: false, targetShip: null, targetId: '', runHome: true };
     }
 
     // HUNT: an enemy carries the pod -> chase the carrier with a small LEAD so it looks like a real
@@ -329,7 +375,9 @@ export class DemoBots {
     if (ai.role === 'hunt') {
       const carrier = ai.targetId && room.state.ships.get(ai.targetId);
       if (carrier && carrier.alive && carrier.carrying) {
-        const lead = this._leadPoint(s, carrier, 0.5);
+        // Lead harder (0.9s vs 0.5s) so hunters cut the carrier off on an intercept line instead of
+        // trailing behind — a boosting carrier should feel genuinely chased down, not politely followed.
+        const lead = this._leadPoint(s, carrier, 0.9);
         const d = this._dist(s.pos, { x: carrier.px, y: carrier.py, z: carrier.pz });
         // chase:true lets _think boost after a fleeing/boosting carrier even though we also want to
         // shoot it — so the enemy team genuinely runs down a blue-team human hauling the pod home.
