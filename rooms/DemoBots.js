@@ -17,8 +17,13 @@
 // treat them exactly like players — no special cases in the hot loops.
 
 import { Ship } from './schema.js';
-import { stepShip, forwardFromQuat, yawQuatToward } from '../shared/flightModel.js';
+import { stepShip, forwardFromQuat, yawQuatToward, FLIGHT } from '../shared/flightModel.js';
 import { statsFor } from './shipStats.js';
+
+// Max yaw/pitch rate (rad/s) at full deflection — the number the turn-radius governor divides speed
+// by to know how tightly a bot can corner at its current velocity. Sourced from the shared model so
+// it always tracks the real flight physics.
+const FLIGHT_TURN = FLIGHT.TURN;
 
 // Team rosters mirror shipStats.js (blue hero hulls / red captured hulls).
 const BLUE_HULLS = ['concept', 'fury', 'lightning'];
@@ -203,57 +208,44 @@ export class DemoBots {
     const runningHome = goal.runHome && goal.dist > 120;
     input.boost = (runningHome || chasingCarrier || (goal.dist > BOT_BOOST_RANGE && !goal.shoot)) && !goal.precision;
 
-    // PRECISION APPROACH to the pod (grab): a fighter can't stop, and at ~74 u/s it clears the 22u
-    // pickup window in ~0.3s — a full-speed pass almost always MISSES and the bot loops back forever.
-    // So on the final approach we throttle DOWN and even reverse-brake so the bot decelerates INTO the
-    // pocket and actually connects. This is the single biggest fix for "gets close then circles".
+    // ---- UNIFIED TURN-RADIUS THROTTLE GOVERNOR --------------------------------------------------
+    // ROOT CAUSE of the wide loops: a fighter at full speed (74 u/s, turn rate 2.6 rad/s) has a
+    // MINIMUM TURN RADIUS of ~28u. If the goal is closer than the bot's current turn radius, NO amount
+    // of steering can curve onto it — the bot physically must arc past and loop back, forever. The old
+    // governors gated braking on the goal's ANGLE (aligned < 0.4), which missed every bot arcing wide
+    // at a moderate bearing, so they looped anyway. The correct, universal rule is physics: compare the
+    // bot's turn radius at its CURRENT speed to the distance-to-goal, and if it can't make the corner,
+    // SLOW DOWN until it can. This one rule replaces both ad-hoc governors and kills the loops.
+    const d = goal.dist;
+    const speed = Math.hypot(s.vel.x, s.vel.y, s.vel.z);
+    // Turn radius at the current speed (r = v / omega). Bearing error (1 - aligned) scales how tight a
+    // turn we actually need: a goal dead ahead needs no turn, one off to the side needs the full radius.
+    const turnRadius = speed / FLIGHT_TURN;                 // ~28u at top speed, shrinks as we slow
+    const bearingErr = Math.max(0, 1 - aligned);            // 0 = dead ahead, up to 2 = dead behind
+    // The distance at which we must already be slow enough to corner onto the goal. If the goal is
+    // inside (turnRadius * a headroom factor scaled by how much we need to turn), we're going too fast
+    // to make it — scrub speed. Precision (pod grab) needs to actually STOP in a tiny window, so it
+    // demands a much slower final speed; combat/escort points can be taken at a brisker clip.
+    const needFactor = 1.15 + bearingErr * 1.6;             // sharper required turn -> need more room
+    const mustCornerDist = turnRadius * needFactor;
     if (goal.precision) {
+      // Pod grab: decelerate INTO the pickup window so the bot settles ON the pod instead of blowing
+      // past it. Speed target ramps down with distance; floor kept decisive (not a crawl) so it reads
+      // as a committed snatch. Far out we run fast to close; inside ~380u we bleed toward ~24 u/s.
       input.boost = false;
-      const d = goal.dist;
-      const speed = Math.hypot(s.vel.x, s.vel.y, s.vel.z);
-      // ROOT CAUSE of the loops: at full speed (74 u/s) with a 2.6 rad/s turn rate, a fighter's
-      // minimum turn radius (~28u) is BIGGER than the 22u pickup window — so a fast bot literally
-      // cannot turn tight enough to stay on the pod and orbits it forever. The fix is a hard SPEED
-      // LIMIT that shrinks with distance: far out we may run fast to close, but as we near the pod we
-      // force the bot slow so its turn radius collapses well inside the window and it can settle ON it.
-      // Commit HARDER than before: run in fast from range, and only slow to a still-decisive speed in
-      // the final pocket (not a ~10 u/s crawl, which read as loitering). Higher floor = bots snatch the
-      // pod with intent while the ramp still shrinks the turn radius enough to actually connect.
-      //   >380u: full approach speed; 380->0u: target speed ramps 90 -> ~26 u/s
-      const targetSpeed = d > 380 ? 90 : (26 + (d / 380) * 64);
-      if (aligned < 0.3 && d < 160) {
-        // Badly pointed away from the pod up CLOSE: stop thrusting and let drag scrub speed while we
-        // pivot hard onto it (tiny radius). Only in the tight pocket where a wide arc would miss.
-        input.thrust = false; input.reverse = speed > targetSpeed * 1.5;
-      } else if (speed > targetSpeed + 30) {
-        // Well over our distance-appropriate speed: coast down so the turn radius stays inside the
-        // window. Looser threshold than before so bots keep their momentum and drive the grab home.
-        input.thrust = false; input.reverse = speed > targetSpeed + 60;
-      } else {
-        // At/near target speed: keep thrusting toward the pod. Committing beats feathering — a bot that
-        // keeps its nose on the pod and its throttle up looks like it WANTS the flag.
-        input.thrust = true; input.reverse = false;
-      }
-    } else {
-      // UNIVERSAL ANTI-ORBIT GOVERNOR (all non-precision goals: contest / escort / hunt). Same physics
-      // truth as the pod approach — a fighter's turn radius at full speed is far larger than the small
-      // points these roles fly to, so a fast bot that's slightly off-target circles it. The fix: near a
-      // goal, only run fast when it's actually IN FRONT of us; if it's off to the side/behind, cut
-      // throttle (brake if we're really moving) so we slow down, turn tight ONTO it, then re-accelerate.
-      // This is what stops the "loop de loops" everywhere, not just at the pod.
-      const d = goal.dist;
-      const speed = Math.hypot(s.vel.x, s.vel.y, s.vel.z);
-      // Tighter braking window than before (180u & aligned<0.4, was 260u & 0.6): bots now only scrub
-      // speed when they're genuinely about to overshoot a close point pointed the wrong way. In a
-      // dogfight that means they keep PRESSING the target instead of constantly coasting — which is
-      // what read as "sheepish looping." A hostile that's roughly ahead gets bored down on, not braked.
-      if (d < 180 && aligned < 0.4) {
-        input.thrust = false;
-        input.reverse = speed > 55;
-        input.boost = false;
-      }
-      // Otherwise keep the default (thrust:true, plus any boost decided above) and bear down on the goal.
+      const targetSpeed = d > 380 ? 88 : (24 + (d / 380) * 64);
+      if (speed > targetSpeed + 12) { input.thrust = false; input.reverse = speed > targetSpeed + 45; }
+      else { input.thrust = true; input.reverse = false; }
+    } else if (d < mustCornerDist && speed > 22) {
+      // Can't make the corner at this speed: cut throttle so drag scrubs speed (and hard-brake if we're
+      // really barreling in and badly off-line), which collapses the turn radius until the bot can pull
+      // its nose onto the goal. As it slows, mustCornerDist shrinks with it, so it re-accelerates the
+      // instant it CAN corner — a tight, decisive turn-in instead of a lazy orbit.
+      input.thrust = false;
+      input.reverse = (bearingErr > 0.6 && speed > 46);
+      input.boost = false;
     }
+    // else: keep the default (thrust:true + any boost decided above) and bear straight down on the goal.
 
     // Fire control: bolts when a hostile is close and roughly ahead; the odd missile at mid range.
     if (goal.shoot && goal.targetShip) {
@@ -470,22 +462,27 @@ export class DemoBots {
     // error at all, so a bot could never settle wings-level on its target and just corkscrewed.
     // steer sign matches stepShip (yawRate = -steerX*TURN, pitchRate = -steerY*TURN): to yaw toward a
     // right-side goal we need negative steerX, hence -rdot; to pitch toward a high goal, -udot.
-    const YAW_GAIN = 1.35;   // horizontal turn authority
-    const PITCH_GAIN = 0.9;  // gentler vertical authority so bots turn mostly in-plane (natural look)
-    let steerX = -rdot * YAW_GAIN + ai.jitterX;
-    let steerY = -udot * PITCH_GAIN + ai.jitterY;
-    // Goal is behind us: rdot/udot go small near the singular "straight back" bearing, so nudge a
-    // consistent yaw so the bot commits to swinging AROUND instead of pitching over the top (a loop).
-    if (fdot < 0) {
-      const dir = rdot >= 0 ? 1 : -1;           // keep turning the way we're already leaning
-      steerX = -dir * (0.6 + 0.5 * (1 + fdot)); // firmer yaw the more directly behind the goal is
-      steerY *= 0.35;                            // suppress pitch so it turns flat, not over the top
-    }
+    // Drive the turn off the true bearing ANGLE, not its sine. rdot/udot are sines of the bearing
+    // error, so at a 30-40 deg bearing they read only ~0.5-0.65 and the old gains produced a limp
+    // half-deflection — the bot under-steered and arced wide (the "lazy loop"). Using atan2 against
+    // the forward component gives the real angle, so a wide bearing commands a firm, proportional turn
+    // that snaps the nose onto the goal, while a near-aligned nose still eases off and flies straight.
+    const YAW_GAIN = 1.9;    // horizontal turn authority (per radian of horizontal bearing error)
+    const PITCH_GAIN = 1.35; // vertical authority — still a touch gentler so turns read mostly in-plane
+    const yawErr = Math.atan2(rdot, Math.max(1e-3, fdot));   // signed horizontal bearing angle (rad)
+    const pitchErr = Math.atan2(udot, Math.max(1e-3, fdot)); // signed vertical bearing angle (rad)
+    let steerX = -yawErr * YAW_GAIN + ai.jitterX;
+    let steerY = -pitchErr * PITCH_GAIN + ai.jitterY;
+    // Goal is behind us: atan2 already yaws the SHORT way around toward it (|yawErr| -> pi), so we no
+    // longer force a synthetic yaw. We only SUPPRESS pitch so the bot swings around FLAT in the yaw
+    // plane instead of pitching up and over the top into a loop — a coordinated flat turn reads far
+    // more like a purposeful reversal onto the objective than a vertical barrel-roll.
+    if (fdot < 0) steerY *= 0.3;
     // Allow a firm turn (up to the flight model's own ±1.4 steer range) so a bot can actually swing
     // its nose onto the pod on a close approach instead of arcing wide past it. The old ±1.0 cap left
     // bots under-steering near the objective, which read as a lazy loop.
-    steerX = clamp(steerX, -1.3, 1.3);
-    steerY = clamp(steerY, -1.0, 1.0);
+    steerX = clamp(steerX, -1.4, 1.4);
+    steerY = clamp(steerY, -1.1, 1.1);
     // Bank PROPORTIONALLY into the yaw for a natural coordinated turn — and only as much as we're
     // actually yawing. A constant/hard roll while also pitching is precisely what read as a barrel
     // roll; tying roll to the (bounded) yaw command keeps the wings level when flying straight.
