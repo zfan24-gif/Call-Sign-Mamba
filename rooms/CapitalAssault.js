@@ -211,6 +211,36 @@ export class CapitalAssault {
     return n;
   }
 
+  // --- Bot AI support: what should an attacker on `attackerTeam` shoot on the ENEMY capital? --------
+  // Returns the world position of the highest-priority LIVE target on the enemy capital, or null if
+  // the capital is already dead. While ANY shield generator lives the hull is near-invulnerable, so
+  // the priority is: nearest live SHIELD GENERATOR first; once they're all down, the hull CENTER
+  // (baseCenter) becomes the target so bots pour fire into the exposed hull to win. `alsoKind` tells
+  // the caller whether it's aiming at a 'shieldgen', 'hull', or nothing.
+  botCapitalTarget(attackerTeam, from) {
+    const capTeam = attackerTeam === 0 ? 1 : 0;   // attack the OTHER faction's capital
+    const hull = capTeam === 0 ? this.room.state.blueCapHull : this.room.state.redCapHull;
+    if (hull <= 0) return null;                    // capital already destroyed
+    // Shields up while any generator lives -> attack the nearest live generator.
+    let best = null, bestD = Infinity;
+    for (const s of this._emp.values()) {
+      if (s.capTeam !== capTeam || s.kind !== 'shieldgen' || !s.e.alive) continue;
+      const p = s.worldPos;
+      const dx = p.x - from.x, dy = p.y - from.y, dz = p.z - from.z;
+      const d = dx * dx + dy * dy + dz * dz;
+      if (d < bestD) { bestD = d; best = { x: p.x, y: p.y, z: p.z, kind: 'shieldgen', key: s.key }; }
+    }
+    if (best) return best;
+    // All generators down -> the hull itself is now the objective. Aim at the capital's center.
+    const c = this.room.baseCenter(capTeam);
+    return { x: c.x, y: c.y, z: c.z, kind: 'hull', key: '' };
+  }
+
+  // The enemy capital's center for `attackerTeam` (used as a rally/standoff anchor by bots).
+  enemyCapitalCenter(attackerTeam) {
+    return this.room.baseCenter(attackerTeam === 0 ? 1 : 0);
+  }
+
   // Per-tick: run every cannon's aim + burst-fire logic. Called from room.tick() while CSA is live.
   update(dt) {
     if (!this.active) return;
@@ -309,15 +339,22 @@ export class CapitalAssault {
   _clearShot(from, to, firingTeam) {
     for (const team of [0, 1]) {
       const c = this.room.baseCenter(team);
-      const coreR = this.room.baseCollideRadius ? this.room.baseCollideRadius(team) : 90;
+      // For the FIRING cannon's OWN capital, block only against the tight SOLID CORE — the actual
+      // impassable body. Using the loose outer collide radius here falsely blocked every shot at a
+      // pilot hugging the hull (they sit inside the outer envelope but outside the solid core), so
+      // a capital never fired at a ship parked on top of it. The ENEMY capital keeps the fuller
+      // envelope so a shot still can't tunnel through its body to reach a pilot on the far side.
+      let coreR;
+      if (team === firingTeam) coreR = this.room.baseSolidCore ? this.room.baseSolidCore(team) : 62;
+      else coreR = this.room.baseCollideRadius ? this.room.baseCollideRadius(team) : 90;
       // Nudge the segment start out along the shot direction so a cannon's own hull skin right at the
       // muzzle doesn't self-block every shot.
       const dir = norm(sub(to, from));
       const start = { x: from.x + dir.x * 4, y: from.y + dir.y * 4, z: from.z + dir.z * 4 };
       const d2 = segPointDist2(start.x, start.y, start.z, to.x, to.y, to.z, c.x, c.y, c.z);
-      // Slightly tighter than the full collision envelope so grazing a hull edge doesn't block every
-      // legit shot along the flank; still catches a shot that would clearly bore through the body.
-      const block = coreR * 0.82;
+      // For the firing hull use the solid core almost exactly (the true blocker); for the enemy hull
+      // stay slightly tighter than its full envelope so grazing an edge doesn't kill every flank shot.
+      const block = team === firingTeam ? coreR * 1.0 : coreR * 0.82;
       if (d2 < block * block) return false;
     }
     return true;
@@ -403,6 +440,56 @@ export class CapitalAssault {
     }
     return false;
   }
+
+  // Test a player/bot MISSILE (from the missile fuse loop) against the ENEMY capital's emplacements
+  // and, once its shield gens are down, its HULL. Returns true if the missile detonated on the capital
+  // (so the caller consumes it and plays a warhead blast). Mirrors testBoltHit but with a warhead's
+  // larger proximity radius and heavier damage — a missile is a decisive anti-structure weapon, so a
+  // hit on a generator does real work and a hull hit (shields down) bites hard. `mx,my,mz` is the
+  // missile's previous position and `nx,ny,nz` its advanced position (the swept segment this tick), so
+  // a fast dart can't tunnel past a small emplacement between ticks.
+  testMissileHit(m, mx, my, mz, nx, ny, nz) {
+    const targetTeam = m.team === 0 ? 1 : 0;   // shooters attack the ENEMY capital
+    const dmg = this._missileDamage();
+    // 1) Emplacements first: a warhead within the (generous) blast radius of a live cannon/generator
+    //    guts it. The radius is wider than a bolt's since a missile detonates with a proximity fuse.
+    let hitKey = null, hitDist2 = Infinity, hitPos = null;
+    for (const s of this._emp.values()) {
+      if (s.capTeam !== targetTeam || !s.e.alive) continue;
+      const r = s.kind === 'shieldgen' ? 22 : 20;   // warhead proximity radius (bigger than a bolt's)
+      const d2 = segPointDist2(mx, my, mz, nx, ny, nz, s.worldPos.x, s.worldPos.y, s.worldPos.z);
+      if (d2 < r * r && d2 < hitDist2) { hitDist2 = d2; hitKey = s.key; hitPos = s.worldPos; }
+    }
+    if (hitKey) {
+      this._damageEmplacement(hitKey, dmg);
+      this.room.broadcast('missileHit', { x: hitPos.x, y: hitPos.y, z: hitPos.z, owner: m.owner, victim: '' });
+      return true;
+    }
+
+    // 2) HULL: only takes real damage once ALL shield gens are down. While shielded, a warhead that
+    //    reaches the hull is DEFLECTED (consumed, no damage) exactly like a bolt so it visibly stops
+    //    at the dome. Tested against the capital's solid core sphere with a small warhead standoff so
+    //    a proximity detonation just outside the hull still counts.
+    const c = this.room.baseCenter(targetTeam);
+    const coreR = (this.room.baseCollideRadius ? this.room.baseCollideRadius(targetTeam) : 90) + 6;
+    const d2 = segPointDist2(mx, my, mz, nx, ny, nz, c.x, c.y, c.z);
+    if (d2 < coreR * coreR) {
+      const gens = this.liveGens(targetTeam);
+      if (gens > 0) {
+        this.room.broadcast('capShieldDeflect', { team: targetTeam, x: nx, y: ny, z: nz });
+      } else {
+        this._damageCapitalHull(targetTeam, dmg * 0.5, nx, ny, nz);
+      }
+      this.room.broadcast('missileHit', { x: nx, y: ny, z: nz, owner: m.owner, victim: '' });
+      return true;
+    }
+    return false;
+  }
+
+  // A missile's damage to capital structures — a fixed heavy warhead value (missiles don't scale with
+  // hull firepower the way bolts do; the payload is the same regardless of who launched it). Tuned so
+  // a couple of hits kill a shield generator and a salvo meaningfully chews the exposed hull.
+  _missileDamage() { return 45; }
 
   // A player bolt's damage to capital structures, scaled by the shooter's firepower (heavier hulls
   // chew the capital faster), mirroring the ship-bolt damage scaling in advanceBolts.

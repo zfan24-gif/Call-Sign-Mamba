@@ -52,6 +52,15 @@ const BOT_FIRE_CHANCE = 0.82;      // per-eligible-tick chance to actually fire 
 const BOT_MISSILE_RANGE = 1050;    // launch a missile when locked-ish within this
 const BOT_MISSILE_COOLDOWN = 5.0;  // seconds between a bot's missiles (on top of the room's own cap)
 const BOT_MISSILE_CHANCE = 0.05;   // per-tick chance a missile spikes out (was 0.02)
+// CSA assault-run missiles vs. the enemy CAPITAL. It's a huge, stationary target, so an assault bot
+// throws warheads at it far more readily than at a jinking pilot: longer launch range, a wider firing
+// cone (the whole hull is "roughly ahead"), a higher per-tick chance, and a shorter cadence so a
+// pressing squad actually chews the shield generators / exposed hull down with missiles as well as
+// bolts. Still gated by the bot's ammo rack + the room's own MISSILE_COOLDOWN, so it can't spam.
+const BOT_CSA_MISSILE_RANGE = 900;     // launch at the capital from within this
+const BOT_CSA_MISSILE_CONE = 0.8;      // dot(nose, toCapital) must exceed this (wide — big target)
+const BOT_CSA_MISSILE_CHANCE = 0.14;   // per-tick chance to salvo a warhead at the capital
+const BOT_CSA_MISSILE_COOLDOWN = 3.0;  // seconds between an assault bot's anti-capital missiles
 const BOT_BOOST_RANGE = 460;       // boost to close the gap when the target is beyond this (closes sooner)
 const BOT_ENGAGE_RANGE = 1400;     // beyond this a bot regroups toward the objective instead of dogfighting
 const BOT_REACT_JITTER = 0.05;     // steering imperfection so aim isn't robotic. Bumped up to keep the now
@@ -149,6 +158,12 @@ export class DemoBots {
       // ~55% of each team leans DEFENSE (recover our disk when it's stolen/loose) and the rest lean
       // OFFENSE (go steal the enemy disk). Stable per-bot so the split doesn't flicker frame to frame.
       cddOffense: Math.random() < 0.45,
+      // CSA role BIAS: ~1/3 of each team leans pure DOGFIGHT (screen the assault / hunt enemy pilots)
+      // while the rest press the enemy capital. Stable per-bot so the assault/escort split reads
+      // consistently instead of flickering. Even assault bots break to swat a pilot right on them.
+      csaDogfighter: Math.random() < 0.34,
+      csaTarget: null,   // cached enemy-capital aim point (generator/hull) for the assault role
+
       // Anti-stall: sim time a hunter has spent unable to reach a carrier tucked in its base; when it
       // grows an offense-biased bot peels off to press the enemy disk so the match keeps flowing.
       stuckHuntSince: 0,
@@ -267,6 +282,10 @@ export class DemoBots {
       // else at/under cornering speed: keep the default thrust (+ any boost) and bear down on the goal.
     }
 
+    // Missile cooldown ticks every frame regardless of what we're shooting at, so an assault bot's
+    // rack paces the same whether it's throwing warheads at a pilot or at the enemy capital.
+    if (ai.botMissileCd > 0) ai.botMissileCd -= dt;
+
     // Fire control: bolts when a hostile is close and roughly ahead; the odd missile at mid range.
     if (goal.shoot && goal.targetShip) {
       const fwd = forwardFromQuat(s.quat);
@@ -276,8 +295,22 @@ export class DemoBots {
       if (range < BOT_FIRE_RANGE && dot > BOT_FIRE_CONE && Math.random() < BOT_FIRE_CHANCE) {
         room.tryFire(sid);
       }
-      if (ai.botMissileCd > 0) ai.botMissileCd -= dt;
-      if (ai.botMissileCd <= 0 && range < BOT_MISSILE_RANGE && dot > 0.9 && Math.random() < BOT_MISSILE_CHANCE) {
+      // ---- CSA ANTI-STRUCTURE MISSILES ---------------------------------------------------------
+      // On a capital attack run the goal's "targetShip" is a pseudo target standing in for the enemy
+      // capital's current aim point (a shield generator, or the exposed hull once the gens are down).
+      // A missile there is a DUMBFIRE (no ship lock) that the server's testMissileHit path detonates
+      // on the capital — so assault bots contribute real warhead damage to knocking the capital out,
+      // not just bolts. It's a big, fat, stationary target, so we fire more freely (wider cone, longer
+      // range, higher chance) than at a jinking pilot, on the bot's own missile cooldown + ammo rack.
+      if (ai.role === 'csaAssault') {
+        if (ai.botMissileCd <= 0 && (ship.missiles | 0) > 0 &&
+            range < BOT_CSA_MISSILE_RANGE && dot > BOT_CSA_MISSILE_CONE &&
+            Math.random() < BOT_CSA_MISSILE_CHANCE) {
+          room.tryFireMissile(sid, '');   // dumbfire at the capital (no ship to lock)
+          ai.botMissileCd = BOT_CSA_MISSILE_COOLDOWN;
+        }
+      } else if (ai.botMissileCd <= 0 && range < BOT_MISSILE_RANGE && dot > 0.9 && Math.random() < BOT_MISSILE_CHANCE) {
+        // Anti-SHIP missile (all other modes / the csaDog role): needs a real lock on a pilot.
         room.tryFireMissile(sid, goal.targetId);
         ai.botMissileCd = BOT_MISSILE_COOLDOWN;
       }
@@ -418,6 +451,39 @@ export class DemoBots {
     const room = this.room;
     const team = ship.team;
     ai.forceDisk = null;   // cleared each reassignment; only the offense-peel path below re-sets it
+
+    // ---- CAPITAL SHIP ASSAULT ------------------------------------------------------------------
+    // No cargo in CSA: the objective is the ENEMY CAPITAL. Each bot presses it (knock out its shield
+    // generators, then pour fire into the exposed hull) while opportunistically dogfighting an enemy
+    // pilot that gets close. A stable per-bot bias makes a minority peel off to purely dogfight so
+    // the arena reads as a real assault + escort screen, not a silent gaggle flying at one point.
+    if (room.isCSA && room.isCSA() && room.capitalAssault) {
+      const tgt = room.capitalAssault.botCapitalTarget(team, s.pos);
+      // A near enemy pilot we can swat on the way in (kept snappy so bots feel alive around you).
+      const nearId = this._nearestHostile(s, team);
+      const near = nearId && room.state.ships.get(nearId);
+      const nearD = near ? this._dist(s.pos, { x: near.px, y: near.py, z: near.pz }) : Infinity;
+      // Dogfighter bias: ~1/3 of the squad prioritizes hunting enemy pilots (screen/aggression) while
+      // the rest push the capital. Even the assault bots break to shoot a pilot right on top of them.
+      const dogfighter = ai.csaDogfighter;
+      if (!tgt) {
+        // Enemy capital already dead (match effectively over) -> just fight nearby pilots.
+        ai.role = 'csaDog'; ai.targetId = nearId || '';
+        return;
+      }
+      if ((dogfighter && nearD < BOT_ENGAGE_RANGE) || nearD < 320) {
+        // Commit to the dogfight when biased to it (and a target's in range) or when a pilot is right
+        // in our face — otherwise a bot ignores a threat and flies robotically at the capital.
+        ai.role = 'csaDog'; ai.targetId = nearId || '';
+        return;
+      }
+      // Press the capital objective; still shoot the nearest pilot if one wanders into our sights.
+      ai.role = 'csaAssault';
+      ai.csaTarget = tgt;                 // {x,y,z,kind} enemy-capital aim point
+      ai.targetId = (nearD < BOT_FIRE_RANGE) ? (nearId || '') : '';
+      return;
+    }
+
     const flag = this._objectiveFlag(team, ai);
 
     // I'm the carrier: my role is fixed (run it home) — handled in _goalPoint, but note it here.
@@ -482,6 +548,55 @@ export class DemoBots {
   _goalPoint(sid, ai, s, ship) {
     const room = this.room;
     const team = ship.team;
+
+    // ---- CSA GOALS -----------------------------------------------------------------------------
+    // csaDog: pure dogfight — settle onto a nearby enemy pilot's six (reuses the pursuit-curve logic
+    // so bots don't ram + loop). csaAssault: attack run on the enemy capital, but approach to a
+    // STANDOFF ring outside the hull and strafe from there (flying dead at the hull would loop into
+    // it exactly like the pod-at-base case). Bots fan around the objective by their stable slot so
+    // the squad spreads across the capital instead of stacking on one generator.
+    if (ai.role === 'csaDog') {
+      const tgt = ai.targetId && room.state.ships.get(ai.targetId);
+      if (tgt && tgt.alive) {
+        const d = this._dist(s.pos, { x: tgt.px, y: tgt.py, z: tgt.pz });
+        const aim = this._pursuitPoint(s, tgt, d);
+        return { x: aim.x, y: aim.y, z: aim.z, dist: d, shoot: true, targetShip: tgt, targetId: ai.targetId, chase: true };
+      }
+      // No live target -> fall through to press the capital so we never idle.
+    }
+    if (ai.role === 'csaAssault' && room.capitalAssault) {
+      const tgt = ai.csaTarget || room.capitalAssault.botCapitalTarget(team, s.pos);
+      if (tgt) {
+        // Strafe from a standoff ring: aim at a point on the line from the capital center out toward
+        // the bot's own stable slot, ~150u off the target, so it makes firing passes instead of
+        // boring straight into the hull and looping. Once it's in that ring it can shoot the target.
+        const c = room.capitalAssault.enemyCapitalCenter(team);
+        // Outward direction from the capital center toward this bot's fixed fan slot (stable lane).
+        const ox = Math.cos(ai.slot), oy = Math.sin(ai.slot) * 0.4, oz = Math.sin(ai.slot * 1.7);
+        const ol = Math.hypot(ox, oy, oz) || 1;
+        const STANDOFF = 150;
+        const wx = tgt.x + (ox / ol) * STANDOFF;
+        const wy = tgt.y + (oy / ol) * STANDOFF;
+        const wz = tgt.z + (oz / ol) * STANDOFF;
+        const wd = this._dist(s.pos, { x: wx, y: wy, z: wz });
+        // Shoot the capital target (generator/hull) whenever it's roughly ahead + in range; also keep
+        // any nearby enemy pilot as a secondary trigger via ai.targetId in _think's fire block.
+        const distToTgt = this._dist(s.pos, tgt);
+        // Expose the capital as a "shootable" goal out to the wider MISSILE range so _think's fire
+        // block runs and can consider a warhead launch from standoff; the bolt trigger inside _think
+        // is still gated by its own tighter BOT_FIRE_RANGE/cone, so cannons only chatter up close.
+        const shootCap = distToTgt < BOT_CSA_MISSILE_RANGE;
+        // Present the CAPITAL point as a pseudo "targetShip" for fire control (px/py/pz getters), so
+        // _think's bolt cone/range test can line up on the generator/hull just like a ship target.
+        const capAsTarget = { px: tgt.x, py: tgt.y, pz: tgt.z, vx: 0, vy: 0, vz: 0, alive: true };
+        return {
+          x: wx, y: wy, z: wz, dist: wd,
+          shoot: shootCap, targetShip: shootCap ? capAsTarget : null, targetId: '',
+          chase: false,
+        };
+      }
+    }
+
     // Honor a peel-off target (an offense bot that abandoned a stalled hunt for the enemy disk); else
     // fly this bot's normal per-bot objective disk. Keeps the goal aligned with the assigned role.
     const flag = ai.forceDisk || this._objectiveFlag(team, ai);

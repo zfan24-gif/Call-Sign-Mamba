@@ -501,6 +501,12 @@ export class ArenaRoom extends Room {
   // geometry instead of hard-coding a guess when deciding if a carrier is unreachable inside its base.
   baseCollideRadius(team) { return baseCollideRadius(team); }
 
+  // A team's SOLID-CORE radius — the tight inner sphere a bolt actually can't pass through (a ship
+  // can physically fly right up to it). CSA cannon line-of-sight uses this against the FIRING
+  // cannon's own hull so a pilot hugging the hull (inside the loose outer envelope but outside the
+  // solid body) is still a valid target instead of being falsely "blocked by our own ship".
+  baseSolidCore(team) { return baseSolidCore(team); }
+
   // The SINGLE neutral pod's HOME rest position: the arena CENTER (origin), the exact midpoint
   // between the two bases, so both teams have an equal run for it.
   cargoHome() {
@@ -1045,6 +1051,18 @@ export class ArenaRoom extends Room {
       // Proximity fuse: detonate on the first live hostile within blast radius (swept segment so a
       // fast missile doesn't tunnel past a target between ticks).
       let consumed = false;
+
+      // CSA: a player/bot missile can detonate on the ENEMY capital's emplacements (and, once its
+      // shield gens are down, its exposed hull) — the same anti-structure path bolts use, but with a
+      // heavier warhead. Capital cannon fire never spawns missiles, so there's no owned-capital case.
+      // Tested first so a warhead aimed at the capital chews its defenses instead of sailing through.
+      if (this.isCSA()) {
+        if (this.capitalAssault.testMissileHit(m, m.px, m.py, m.pz, nx, ny, nz)) {
+          this.state.missiles.delete(id);
+          continue;
+        }
+      }
+
       for (const [sid, ship] of this.state.ships) {
         if (!ship.alive) continue;
         if (sid === m.owner) continue;
