@@ -10,7 +10,7 @@
 // out with TODO markers where they'll slot in.
 import { Room } from '@colyseus/core';
 import { ArenaState, Ship, Bolt, Missile, Cargo } from './schema.js';
-import { stepShip, forwardFromQuat, yawQuatToward } from '../shared/flightModel.js';
+import { stepShip, forwardFromQuat, yawQuatToward, FLIGHT } from '../shared/flightModel.js';
 import { sanitizeShip, statsFor } from './shipStats.js';
 // ---- DEMO-ONLY (REMOVE BEFORE SHIP) ----------------------------------------------------------
 // AI squadron filler so a CTC lobby can be recorded with a lively 4v5 match WITHOUT 9 human pilots.
@@ -19,6 +19,9 @@ import { sanitizeShip, statsFor } from './shipStats.js';
 import { DemoBots } from './DemoBots.js';
 // Master switch for the demo squadron. Flip to false (or delete the DemoBots wiring) to disable.
 const DEMO_BOTS = true;
+// Capital Ship Assault: the authoritative capital-defense controller (emplacements + cannon AI +
+// shield-gated hull damage + win condition). Permanent gameplay, not demo scaffolding.
+import { CapitalAssault } from './CapitalAssault.js';
 
 const TICK_HZ = 30;                 // authoritative simulation rate
 const TICK_MS = 1000 / TICK_HZ;
@@ -60,6 +63,10 @@ const LAGCOMP_MAX_REWIND = 0.35;    // hard cap on how far back we'll ever rewin
 const LAGCOMP_INTERP_DELAY = 0.10;  // client renders remote ships this far in the past (interp buffer)
 const LAGCOMP_DEFAULT_RTT = 0.10;   // assumed round-trip when a client hasn't reported a ping (100ms)
 const RESPAWN_DELAY = 4;            // seconds dead before respawning (covers the client warp-in beat)
+// --- Out of Bounds (OOB) --------------------------------------------------------------------
+// A hard competitive boundary: cross FLIGHT.BOUNDARY and a countdown starts; return before it hits
+// zero or the perimeter defenses destroy the ship. Replaces the old soft rubber-band leash.
+const OOB_GRACE = 10;              // seconds a pilot has to get back in-bounds before they're destroyed
 const MAX_BOLTS = 400;              // hard cap on live bolts (safety)
 
 // --- Ship-to-ship hull collisions (authoritative) --------------------------------------------
@@ -115,6 +122,21 @@ function missileTurnForRange(dist) {
 // negative) and the match ends the tick it reaches 0.
 const ROUND_DURATIONS = [300, 600, 900, 1200];   // 5 / 10 / 15 / 20 minutes (seconds)
 const DEFAULT_ROUND = 600;                        // 10 minutes
+// INFINITE round sentinel: roundDuration === 0 means "no time limit". The round clock never counts
+// down and never triggers a clock-out endMatch — the match is decided purely by its objective (a
+// capture target reached, the enemy capital destroyed, etc.). Only the OBJECTIVE modes may select
+// it; the pure-kill modes (SDM / FFA) always need a clock to have a result, so they reject it.
+const ROUND_INFINITE = 0;
+
+// --- Early Access scope ------------------------------------------------------------------------
+// Only these modes are shippable in the Early Access build; the rest are built but gated off. The
+// config handler rejects any mode outside this set so a modified client can't select a locked mode.
+// Widen this array (or set EA_ENFORCE_MODES = false) to open the remaining modes.
+// FULL BUILD: set EA_ENFORCE_MODES = true to re-gate the server to EA_ALLOWED_MODES for the Early
+// Access launch. Left false here so every mode is selectable during development.
+const EA_ENFORCE_MODES = false;
+const EA_ALLOWED_MODES = ['sdm', 'ffa', 'ctc'];
+function eaModeAllowed(mode) { return !EA_ENFORCE_MODES || EA_ALLOWED_MODES.includes(mode); }
 
 // --- Capture the Cargo settings ----------------------------------------------------------------
 // A capture-the-flag mode with a SINGLE NEUTRAL cargo pod that spawns dead-center between the two
@@ -318,14 +340,24 @@ export class ArenaRoom extends Room {
       // Whitelist the mode: Squadron Death Match (teams), Free-For-All (every-man-for-himself),
       // Capture the Cargo (single neutral flag), or Capture the Data Disk (dual team disks, true CTF).
       // Anything else is ignored.
-      if (msg.mode === 'sdm' || msg.mode === 'ffa' || msg.mode === 'ctc' || msg.mode === 'cdd') this.state.mode = msg.mode;
+      // Early Access gate: reject modes that aren't shippable in this build (see EA_ALLOWED_MODES).
+      if ((msg.mode === 'sdm' || msg.mode === 'ffa' || msg.mode === 'ctc' || msg.mode === 'cdd' || msg.mode === 'csa') && eaModeAllowed(msg.mode)) this.state.mode = msg.mode;
       // DEMO-ONLY (REMOVE BEFORE SHIP): arm the AI squadron when the host selects CTC in the lobby,
       // and tear it down if they switch back to another mode so SDM/FFA stay pure-human.
       this.maybeArmDemoBots();
       const d = Number(msg.roundDuration);
-      if (ROUND_DURATIONS.includes(d)) {
+      // Accept a real timed round from the whitelist, OR the INFINITE sentinel (0) but ONLY in an
+      // objective mode (SDM/FFA are decided purely by the clock, so they can never run untimed).
+      if (ROUND_DURATIONS.includes(d) || (d === ROUND_INFINITE && this.objectiveModeSelected())) {
         this.state.roundDuration = d;
         this.state.timeLeft = d;   // keep the displayed lobby clock in sync with the chosen length
+      }
+      // Guard: if the mode is (now) a pure-kill mode (SDM/FFA) but the duration is still the infinite
+      // sentinel — e.g. the host had ∞ selected in CTC and just switched to SDM — snap back to a real
+      // timed default so a clock-dependent mode can never launch without a clock.
+      if (!this.objectiveModeSelected() && this.state.roundDuration === ROUND_INFINITE) {
+        this.state.roundDuration = DEFAULT_ROUND;
+        this.state.timeLeft = DEFAULT_ROUND;
       }
       // Capture the Cargo: captures-to-win target (only 4 / 7 / 10 accepted).
       const ct = Number(msg.captureTarget);
@@ -393,6 +425,11 @@ export class ArenaRoom extends Room {
     // players. Cleared when leaving CTC, at match start, and on dispose.
     this.demoBots = DEMO_BOTS ? new DemoBots(this) : null;
 
+    // Capital Ship Assault controller: owns the two capitals' destructible emplacements (cannons +
+    // shield gens), the authoritative cannon AI (aim/LOS/burst-fire), shield-gated hull damage, and
+    // the destroy-the-enemy-capital win condition. Inert until a CSA match starts.
+    this.capitalAssault = new CapitalAssault(this);
+
     // Broadcast state patches at the SAME 30Hz as the sim (Colyseus defaults to 20Hz/50ms, which
     // makes remote ships update slower than they actually move and pads perceived latency). Matching
     // the patch rate to TICK_HZ means every authoritative tick is replicated, tightening remote motion.
@@ -435,14 +472,34 @@ export class ArenaRoom extends Room {
   // itself differs (one neutral pod vs. two team disks), so all the shared plumbing gates on this.
   isCargoMode() { return this.isCTC() || this.isCDD(); }
 
+  // True while this room is running Capital Ship Assault: each faction attacks the enemy capital.
+  isCSA() { return this.state.mode === 'csa'; }
+
+  // True when the CURRENTLY SELECTED mode is an OBJECTIVE mode (both capture modes + Capital Ship
+  // Assault) — i.e. a mode with a win condition other than a raw kill tally, so it can be played
+  // untimed (roundDuration === ROUND_INFINITE). The pure-kill modes (SDM/FFA) return false: they are
+  // decided solely by the clock, so an infinite round would have no way to end.
+  objectiveModeSelected() { return this.isCargoMode() || this.isCSA(); }
+
+  // True for ANY mode that places the two spread-apart, SOLID capital ships in the arena (both
+  // capture modes AND Capital Ship Assault). The base-spread geometry, solid-capital collisions, and
+  // base-anchored respawns are shared across all of them, so that plumbing gates on this rather than
+  // the cargo-specific isCargoMode().
+  hasCapitals() { return this.isCargoMode() || this.isCSA(); }
+
   // The world-space capital base center for a team. In CTC the base is pushed far out along the
   // spawn-anchor direction (CTC_BASE_SPREAD) so the two capitals sit a long haul apart; in SDM/FFA
   // this is just the raw spawn anchor.
   baseCenter(team) {
     const sp = SPAWN[team] || SPAWN[0];
-    const k = this.isCargoMode() ? CTC_BASE_SPREAD : 1;
+    const k = this.hasCapitals() ? CTC_BASE_SPREAD : 1;
     return { x: sp.pos[0] * k, y: sp.pos[1] * k, z: sp.pos[2] * k };
   }
+
+  // A team's OUTER base collision radius (the envelope that governs the disk-home height + capture
+  // ring). Exposed as a method so helper modules (the demo bots) can read the authoritative base
+  // geometry instead of hard-coding a guess when deciding if a carrier is unreachable inside its base.
+  baseCollideRadius(team) { return baseCollideRadius(team); }
 
   // The SINGLE neutral pod's HOME rest position: the arena CENTER (origin), the exact midpoint
   // between the two bases, so both teams have an equal run for it.
@@ -471,8 +528,11 @@ export class ArenaRoom extends Room {
   // clear() both self-guard against redundant calls).
   maybeArmDemoBots() {
     if (!this.demoBots) return;
-    if (this.isCargoMode() && this.state.matchState === 'lobby') this.demoBots.arm();
-    else if (!this.isCargoMode()) this.demoBots.clear();
+    // Arm the demo squadron for any objective mode that benefits from a lively staged match (both
+    // capture modes AND Capital Ship Assault). Pure-human SDM/FFA get no bots.
+    const wantsBots = this.isCargoMode() || this.isCSA();
+    if (wantsBots && this.state.matchState === 'lobby') this.demoBots.arm();
+    else if (!wantsBots) this.demoBots.clear();
   }
 
   onJoin(client, options) {
@@ -618,7 +678,10 @@ export class ArenaRoom extends Room {
     // --- 0) Round clock (Squadron Death Match) ------------------------------------------------
     // Only counts while the match is LIVE. Decrement toward 0, clamp at 0 (never go negative), and
     // end the match the moment it reaches 0 — the team with the most opponent kills wins.
-    if (this.state.matchState === 'live') {
+    // INFINITE rounds (roundDuration === ROUND_INFINITE, objective modes only) skip the clock
+    // entirely: no countdown, no clock-out. The match ends only when its objective is met (a capture
+    // target reached, the enemy capital destroyed) via those code paths calling endMatch directly.
+    if (this.state.matchState === 'live' && this.state.roundDuration !== ROUND_INFINITE) {
       if (this.state.timeLeft > 0) {
         this.state.timeLeft = Math.max(0, this.state.timeLeft - FIXED_DT);
       }
@@ -686,6 +749,32 @@ export class ArenaRoom extends Room {
         ship.shields = Math.min(maxSh, ship.shields + SHIELD_REGEN * FIXED_DT);
       }
 
+      // Out-of-Bounds (OOB) enforcement (LIVE match only):
+      // If a ship flies past the arena boundary, it has OOB_GRACE seconds to return before it is
+      // destroyed by the perimeter defenses. The countdown is authoritative and mirrored to the
+      // owning client (ship.oobTimer) so the HUD warning + timer read server truth. Only enforced
+      // while the round is live — pilots scattered far out in the pre-round lobby aren't punished.
+      if (this.state.matchState === 'live') {
+        const dist = Math.sqrt(s.pos.x * s.pos.x + s.pos.y * s.pos.y + s.pos.z * s.pos.z);
+        if (dist > FLIGHT.BOUNDARY) {
+          if (ship.oobTimer <= 0) {
+            ship.oobTimer = OOB_GRACE;
+          } else {
+            ship.oobTimer = Math.max(0, ship.oobTimer - FIXED_DT);
+            if (ship.oobTimer <= 0) {
+              ship.oobTimer = 0;
+              // The arena perimeter defenses destroyed the ship (environment kill: no attacker).
+              this.killShip(sessionId, ship, '');
+              continue;   // ship is dead this tick; skip the rest of its live update
+            }
+          }
+        } else if (ship.oobTimer !== 0) {
+          ship.oobTimer = 0;   // back in bounds — reset the countdown
+        }
+      } else if (ship.oobTimer !== 0) {
+        ship.oobTimer = 0;
+      }
+
       // Write authoritative pose back to the replicated schema.
       ship.px = s.pos.x; ship.py = s.pos.y; ship.pz = s.pos.z;
       ship.vx = s.vel.x; ship.vy = s.vel.y; ship.vz = s.vel.z;
@@ -715,8 +804,9 @@ export class ArenaRoom extends Room {
     // --- 1b) Ship-to-ship hull collisions -----------------------------------------------------
     this.resolveShipCollisions();
 
-    // --- 1c) Capital-base collisions (cargo modes only): bases are SOLID, ships can't fly through --
-    if (this.isCargoMode()) this.resolveBaseCollisions();
+    // --- 1c) Capital-base collisions: capitals are SOLID, ships can't fly through them (all modes
+    //         that place capitals — both capture modes and Capital Ship Assault).
+    if (this.hasCapitals()) this.resolveBaseCollisions();
 
     // --- 2) Bolts: advance and hit-detect -----------------------------------------------------
     this.advanceBolts();
@@ -727,6 +817,7 @@ export class ArenaRoom extends Room {
     // --- 4) Capture modes: pickups, carrier tracking, returns, and captures -------------------
     if (this.state.matchState === 'live' && this.isCTC()) this.advanceCargo();
     else if (this.state.matchState === 'live' && this.isCDD()) this.advanceDisks();
+    else if (this.state.matchState === 'live' && this.isCSA()) this.capitalAssault.update(FIXED_DT);
   }
 
   // Authoritative ship-to-ship hull collisions. All-pairs sweep over LIVE ships (fine at 24 players):
@@ -993,6 +1084,15 @@ export class ArenaRoom extends Room {
       const rewind = this.rewindTimeFor(shooterSim);
 
       let consumed = false;
+      // CSA: a player/bot bolt can strike the ENEMY capital's emplacements (and, once its shield gens
+      // are down, its hull). Capital cannon bolts (bolt.capital) skip this — they're the capital's own
+      // fire and only damage ships. Tested first so a well-aimed shot chews the defenses, not the void.
+      if (this.isCSA() && !bolt.capital) {
+        if (this.capitalAssault.testBoltHit(bolt, nx, ny, nz)) {
+          this.state.bolts.delete(id);
+          continue;
+        }
+      }
       // Swept collision: closest approach of the segment (bolt.p -> n) to each enemy ship center.
       for (const [sid, ship] of this.state.ships) {
         if (!ship.alive) continue;
@@ -1380,6 +1480,7 @@ export class ArenaRoom extends Room {
     ship.alive = false;
     ship.hull = 0;
     ship.shields = 0;
+    ship.oobTimer = 0;       // clear any out-of-bounds countdown; a dead ship isn't racing the boundary
     ship.speaking = false;   // a destroyed pilot drops off the radio until they respawn
     // Capture modes: a destroyed carrier DROPS whatever they hauled where they died — killing the
     // flag/disk runner is the primary way to stop a capture, so it goes loose right there.
@@ -1524,6 +1625,7 @@ export class ArenaRoom extends Room {
     s.killStreak = 0;
     ship.alive = true;
     ship.respawnIn = 0;          // alive again — clear the replicated countdown
+    ship.oobTimer = 0;           // fresh spawn is well in-bounds; never inherit a stale OOB countdown
     ship.lastKiller = '';
     s.lastHitAt = this._now;
     s.inputs.length = 0;
@@ -1625,6 +1727,10 @@ export class ArenaRoom extends Room {
     if (this.isCTC()) this.setupCargo();
     else if (this.isCDD()) this.setupDisks();
     else this.clearCargo();
+    // Capital Ship Assault: build both capitals' emplacements + reset hull integrity (or tear any
+    // stale set down for the non-CSA modes so nothing lingers).
+    if (this.isCSA()) this.capitalAssault.setup();
+    else this.capitalAssault.clear();
     this.broadcast('matchStart', {
       roundDuration: this.state.roundDuration,
       mode: this.state.mode,
@@ -1659,6 +1765,26 @@ export class ArenaRoom extends Room {
         winnerId: topId, winnerName: topName, winnerKills: topKills,
       });
       console.log(`[arena] FFA MATCH END — winner=${topName || 'DRAW'} (${topKills} kills) [roomId=${this.roomId}]`);
+      return;
+    }
+
+    if (this.isCSA()) {
+      // Capital Ship Assault: a team WINS by destroying the enemy capital's hull (a capital-down
+      // ends the match immediately via the controller). If the clock runs out first, the team whose
+      // enemy capital is MORE damaged (lower remaining hull) wins; equal hull = draw. winningTeam may
+      // already be set by the controller on a capital-down; only compute it here on a clock-out.
+      if (this.state.winningTeam === -1) {
+        const bh = this.state.blueCapHull, rh = this.state.redCapHull;
+        // Blue wins if the RED capital is worse off (rh < bh), and vice-versa.
+        this.state.winningTeam = rh < bh ? 0 : bh < rh ? 1 : -1;
+      }
+      this.capitalAssault.clear();
+      this.broadcast('matchEnd', {
+        mode: 'csa',
+        winningTeam: this.state.winningTeam,
+        blueCapHull: this.state.blueCapHull, redCapHull: this.state.redCapHull,
+      });
+      console.log(`[arena] CSA MATCH END — BLUE hull ${this.state.blueCapHull|0} : ${this.state.redCapHull|0} RED -> winner=${this.state.winningTeam === -1 ? 'DRAW' : this.state.winningTeam === 0 ? 'BLUE' : 'RED'} [roomId=${this.roomId}]`);
       return;
     }
 

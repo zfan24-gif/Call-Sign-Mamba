@@ -66,6 +66,10 @@ export class Ship extends Schema {
     // can render the carried pod slung under the hull AND so the HUD emphasizes a carrier's targeting
     // brackets (a big deal: shoot the carrier down and the cargo drops). Only meaningful in CTC mode.
     this.carrying = false;
+    // --- Out of Bounds ---
+    // If > 0, the pilot is outside the arena boundaries and has this many seconds to return before
+    // their ship is destroyed by the arena perimeter defenses. 0 means in-bounds.
+    this.oobTimer = 0;
   }
 }
 defineTypes(Ship, {
@@ -94,6 +98,7 @@ defineTypes(Ship, {
   pioneer: 'boolean',
   ready: 'boolean',
   carrying: 'boolean',
+  oobTimer: 'float32',
 });
 
 // ---- Capture the Cargo: the SINGLE neutral cargo pod (the "flag") ------------------------------
@@ -127,6 +132,49 @@ defineTypes(Cargo, {
   homeX: 'float32', homeY: 'float32', homeZ: 'float32',
 });
 
+// ---- Capital Ship Assault (CSA): a hull-mounted EMPLACEMENT (cannon or shield generator) ---------
+// In CSA each team defends a capital ship bristling with destructible emplacements. There are two
+// kinds, both bolted to fixed LOCAL points on the hull (positions are replicated so every client
+// seats the models at the exact authoritative spot, and the targeting computer can lock them):
+//   • kind 'cannon'    — a heavy point-defense cannon. The server aims it at the nearest enemy ship
+//                        within range and, with a clean line of sight, fires bright faction-colored
+//                        laser bursts. Targetable + destroyable (tanky). `firing` pulses true on the
+//                        tick a burst starts so clients play the faction cannon sound + muzzle flash;
+//                        `aimX/Y/Z` is the current world aim point so clients can slew the barrels.
+//   • kind 'shieldgen' — a shield generator. While ANY of a capital's generators live, that capital's
+//                        HULL shrugs off most damage (deflection); kill them all and the hull is soft.
+// HP/alive drive the destruction model; `capTeam` is the capital (and thus the defending team) it
+// belongs to. Keyed in ArenaState.emplacements as `<capTeam>:<index>` so both clients and the room
+// address a specific emplacement deterministically.
+export class Emplacement extends Schema {
+  constructor() {
+    super();
+    this.capTeam = 0;        // owning capital / defending team (0 = blue, 1 = red)
+    this.kind = 'cannon';    // 'cannon' | 'shieldgen'
+    // FIXED mount point in the capital group's LOCAL frame (clients rotate it into world by the
+    // capital's known pose). Never changes within a match.
+    this.lx = 0; this.ly = 0; this.lz = 0;
+    // Outward surface normal at the mount (local frame) so clients orient the emplacement flush.
+    this.nx = 0; this.ny = 1; this.nz = 0;
+    this.hp = 100; this.maxHp = 100;
+    this.alive = true;
+    // Cannon-only live state (ignored for shieldgen). aim* is the current WORLD aim point; `firing`
+    // is a one-tick pulse the server sets when a burst begins so clients react (sound + flash).
+    this.firing = false;
+    this.aimX = 0; this.aimY = 0; this.aimZ = 0;
+  }
+}
+defineTypes(Emplacement, {
+  capTeam: 'uint8',
+  kind: 'string',
+  lx: 'float32', ly: 'float32', lz: 'float32',
+  nx: 'float32', ny: 'float32', nz: 'float32',
+  hp: 'float32', maxHp: 'float32',
+  alive: 'boolean',
+  firing: 'boolean',
+  aimX: 'float32', aimY: 'float32', aimZ: 'float32',
+});
+
 // One networked laser bolt. Spawned authoritatively when a client sends a valid 'fire' intent, then
 // advanced every server tick. Position is streamed so all clients render the same tracer; velocity
 // lets clients smoothly extrapolate between the ~30 Hz patches.
@@ -137,6 +185,9 @@ export class Bolt extends Schema {
     this.team = 0;           // shooter's team (no friendly fire)
     this.px = 0; this.py = 0; this.pz = 0;
     this.vx = 0; this.vy = 0; this.vz = 0;
+    // CSA: true for a CAPITAL CANNON bolt. Clients render these brighter + slightly larger than a
+    // fighter tracer, and they persist far longer / travel much farther off the battlefield.
+    this.capital = false;
   }
 }
 defineTypes(Bolt, {
@@ -144,6 +195,7 @@ defineTypes(Bolt, {
   team: 'uint8',
   px: 'float32', py: 'float32', pz: 'float32',
   vx: 'float32', vy: 'float32', vz: 'float32',
+  capital: 'boolean',
 });
 
 // One networked guided missile. Spawned authoritatively when a client sends a valid 'missile'
@@ -179,6 +231,13 @@ export class ArenaState extends Schema {
     // Capture the Cargo: the single neutral flag, keyed 'flag' (cargo.get('flag')). Populated only
     // when a CTC match starts; empty otherwise so SDM/FFA replicate nothing.
     this.cargo = new MapSchema();
+    // Capital Ship Assault: every destructible hull-mounted emplacement (cannons + shield gens) on
+    // BOTH capitals, keyed '<capTeam>:<index>'. Populated only when a CSA match starts.
+    this.emplacements = new MapSchema();
+    // CSA capital HULL integrity (0..100). A capital only takes real hull damage once its own shield
+    // generators are all destroyed; when its hull hits 0 the OTHER team wins. Unused outside CSA.
+    this.blueCapHull = 100;
+    this.redCapHull = 100;
     this.blueCount = 0;
     this.redCount = 0;
     // --- Match / game-mode state (host-configured in the lobby, server-authoritative) ---
@@ -209,6 +268,9 @@ defineTypes(ArenaState, {
   bolts: { map: Bolt },
   missiles: { map: Missile },
   cargo: { map: Cargo },
+  emplacements: { map: Emplacement },
+  blueCapHull: 'float32',
+  redCapHull: 'float32',
   blueCount: 'uint8',
   redCount: 'uint8',
   mode: 'string',

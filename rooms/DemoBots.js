@@ -145,6 +145,18 @@ export class DemoBots {
       // A FIXED per-bot fan angle for the loose-pod approach so a contesting bot commits to ONE
       // stable approach vector into the pod (a moving offset would make it gently orbit the pod).
       fanAngle: Math.random() * Math.PI * 2,
+      // CDD role BIAS: in Capture the Data Disk there are TWO disks, so a squad shouldn't dogpile one.
+      // ~55% of each team leans DEFENSE (recover our disk when it's stolen/loose) and the rest lean
+      // OFFENSE (go steal the enemy disk). Stable per-bot so the split doesn't flicker frame to frame.
+      cddOffense: Math.random() < 0.45,
+      // Anti-stall: sim time a hunter has spent unable to reach a carrier tucked in its base; when it
+      // grows an offense-biased bot peels off to press the enemy disk so the match keeps flowing.
+      stuckHuntSince: 0,
+      // Grab anti-loop: sim time this bot has been orbiting a loose disk it can't seat (it's near a
+      // base hull, so a straight run arcs into the base and loops). While set, the bot flies out to a
+      // clean standoff waypoint to reset its approach lane before committing to the pickup again.
+      grabLoopSince: 0,
+      grabResetUntil: 0,
       jitterX: 0, jitterY: 0, jitterAt: 0,
     });
 
@@ -289,11 +301,16 @@ export class DemoBots {
   // The role also carries the engagement target so _think knows who to shoot. Result: the flag is the
   // gravity well of the match — exactly the "everyone's going for / defending / attacking the cargo"
   // read you want, and the human is always surrounded by pilots who clearly care about the pod.
-  // The cargo object this bot should treat as its objective this tick. In CTC there is one neutral
-  // 'flag'. In CDD there are TWO team disks: a bot's team STEALS the enemy disk and DEFENDS its own.
-  // Priority: if OUR disk has been stolen/knocked loose, that's the emergency (defend/recover it);
-  // otherwise go after the ENEMY disk (steal it). This lets the shared role logic below stay intact.
-  _objectiveFlag(team) {
+  // The cargo object THIS bot should treat as its objective this tick. In CTC there is one neutral
+  // 'flag' the whole squad fights over. In CDD there are TWO team disks, so the squad must NOT dogpile
+  // one — otherwise a human who steals a disk and parks it at their base leaves the whole enemy team
+  // circling an unreachable carrier while their own disk sits undefended. Instead we SPLIT the team:
+  //   • DEFENSE bias (or when it's a genuine emergency): if OUR disk is stolen/loose, recover it.
+  //   • OFFENSE bias: press the ENEMY disk (steal it / hunt whoever grabbed it) so the game keeps
+  //     flowing even while our own disk is being run home.
+  // `ai` may be null for callers that just want the team-emergency disk (unused paths); it defaults
+  // to the recover-our-disk priority in that case, preserving the old single-objective behavior.
+  _objectiveFlag(team, ai = null) {
     const room = this.room;
     const cargo = room.state.cargo;
     if (!cargo) return null;
@@ -301,19 +318,110 @@ export class DemoBots {
     const ownKey = team === 0 ? 'blueDisk' : 'redDisk';
     const enemyKey = team === 0 ? 'redDisk' : 'blueDisk';
     const own = cargo.get(ownKey), enemy = cargo.get(enemyKey);
-    // Our disk in enemy hands or adrift -> make recovering it the priority objective.
-    if (own && (own.carrier || !own.atHome)) return own;
-    // Otherwise focus the enemy disk (steal it / hunt whoever grabbed it).
+    const ownContested = !!(own && (own.carrier || !own.atHome));   // our disk stolen or adrift
+    // OFFENSE-biased bots keep pressing the ENEMY disk even while our disk is contested — as long as
+    // enough teammates are on defense, this keeps a real two-way fight going instead of a dogpile.
+    if (ai && ai.cddOffense && enemy) {
+      // Still fall back to defense if the enemy disk is already SAFELY OURS to score is impossible
+      // (i.e. someone on our team already carries the enemy disk) — then help recover ours instead.
+      const enemyBeingRunByUs = enemy.carrier && this._sameTeamCarrier(enemy.carrier, team);
+      if (!enemyBeingRunByUs) return enemy;
+      if (ownContested) return own;
+      return enemy;
+    }
+    // DEFENSE bias / default: our disk in enemy hands or adrift is the emergency — recover it.
+    if (ownContested) return own;
+    // Nothing to defend -> go steal the enemy disk.
     return enemy || own || null;
+  }
+
+  // True if session `sid` is a ship on `team` (used to tell "our carrier is running the enemy disk"
+  // apart from "an enemy grabbed our disk").
+  _sameTeamCarrier(sid, team) {
+    const sh = this.room.state.ships.get(sid);
+    return !!(sh && sh.team === team);
+  }
+
+  // The ENEMY team's disk object (the one this team steals), or null. CDD only.
+  _enemyDisk(team) {
+    const cargo = this.room.state.cargo;
+    if (!cargo) return null;
+    return cargo.get(team === 0 ? 'redDisk' : 'blueDisk') || null;
+  }
+
+  // True when a disk carrier has holed up deep inside its OWN base — i.e. it's within the base's
+  // solid-core collision radius of its own base center, where hunters physically cannot reach it
+  // through the hull. That's the "parked at home, unreachable" state that makes hunters circle. Uses
+  // the server's authoritative base geometry so it always matches the real collision.
+  _carrierParkedInBase(carrier) {
+    const room = this.room;
+    if (!carrier || typeof room.baseCenter !== 'function') return false;
+    const c = room.baseCenter(carrier.team);
+    if (!c) return false;
+    const dx = carrier.px - c.x, dy = carrier.py - c.y, dz = carrier.pz - c.z;
+    const d = Math.hypot(dx, dy, dz);
+    // Reach limit ~ the outer collision envelope; inside it a hunter can't cleanly close on the body.
+    const reach = (typeof room.baseCollideRadius === 'function') ? room.baseCollideRadius(carrier.team) : 110;
+    return d < reach + 26;
+  }
+
+  // Geometry helper for the "loose disk sitting at/near a base" case — the #1 cause of bots spinning.
+  // A disk parked at its home spot (or dropped right against a base hull) sits just outside a large
+  // collision sphere; a bot that flies STRAIGHT at it carries speed into the hull, can't seat the
+  // pickup, and arcs around the base forever. This returns the nearest base's geometry when the disk
+  // is close enough to that base for the hull to foul a naive approach, plus a unit OUTWARD vector
+  // (base -> disk) that defines a clean radial lane a bot can ride in on. Returns null when the disk
+  // is in open space (a straight run is fine there).
+  _diskNearBase(disk) {
+    const room = this.room;
+    if (!disk || typeof room.baseCenter !== 'function') return null;
+    let best = null;
+    for (const team of [0, 1]) {
+      const c = room.baseCenter(team);
+      if (!c) continue;
+      const reach = (typeof room.baseCollideRadius === 'function') ? room.baseCollideRadius(team) : 110;
+      const dx = disk.px - c.x, dy = disk.py - c.y, dz = disk.pz - c.z;
+      const d = Math.hypot(dx, dy, dz) || 1;
+      // "Near" = within the collision envelope plus a healthy approach margin, so we catch both a disk
+      // sitting at its home spot and one dropped loose right beside the hull.
+      if (d < reach + 90) {
+        const ux = dx / d, uy = dy / d, uz = dz / d;   // unit outward direction (base -> disk)
+        if (!best || d < best.d) best = { c, reach, d, ux, uy, uz };
+      }
+    }
+    return best;
+  }
+
+  // Route this bot onto a SPECIFIC disk objective (used when an offense bot peels off a stalled hunt
+  // to press the enemy disk). Mirrors the main role logic but scoped to the given disk: hunt whoever
+  // holds it if it's an enemy carrier, escort a friendly carrier, else grab the loose/home disk.
+  _assignToDisk(sid, ai, s, ship, disk) {
+    const room = this.room;
+    const team = ship.team;
+    if (disk.carrier) {
+      const carrier = room.state.ships.get(disk.carrier);
+      if (carrier && carrier.alive) {
+        if (carrier.team !== team) { ai.role = 'hunt'; ai.targetId = disk.carrier; return; }
+        ai.role = 'escort'; ai.targetId = disk.carrier;
+        const threat = this._nearestHostileTo(carrier, team);
+        ai.escortThreat = threat || '';
+        return;
+      }
+    }
+    // Loose or at home: go grab it (committed run), still shooting anything close on the way.
+    ai.role = 'grab';
+    ai.targetId = this._nearestHostile(s, team) || '';
+    ai.forceDisk = disk;   // _goalPoint reads this so the grab flies at THIS disk, not the team default
   }
 
   _assignRole(sid, ai, s, ship) {
     const room = this.room;
     const team = ship.team;
-    const flag = this._objectiveFlag(team);
+    ai.forceDisk = null;   // cleared each reassignment; only the offense-peel path below re-sets it
+    const flag = this._objectiveFlag(team, ai);
 
     // I'm the carrier: my role is fixed (run it home) — handled in _goalPoint, but note it here.
-    if (ship.carrying) { ai.role = 'carry'; ai.targetId = ''; return; }
+    if (ship.carrying) { ai.role = 'carry'; ai.targetId = ''; ai.stuckHuntSince = 0; ai.grabLoopSince = 0; ai.grabResetUntil = 0; return; }
 
     if (flag && flag.carrier) {
       const carrier = room.state.ships.get(flag.carrier);
@@ -321,8 +429,24 @@ export class DemoBots {
         if (carrier.team !== team) {
           // Enemy has the pod -> HUNT the carrier (this is the "gang the flag-runner" show). Aim at
           // the carrier itself so bolts/missiles go at the pod runner, not a random dogfight.
+          // ANTI-STALL: if the carrier has holed up deep INSIDE its own base (its disk home, where we
+          // can't physically reach it through the base collision hull), an OFFENSE-biased hunter that
+          // has been stuck circling gives up the chase and swings to the ENEMY disk instead, so the
+          // whole squad never freezes on one unreachable runner. Defenders keep the pressure on.
+          const parked = this._carrierParkedInBase(carrier);
+          if (parked) {
+            if (!ai.stuckHuntSince) ai.stuckHuntSince = room._now;
+          } else {
+            ai.stuckHuntSince = 0;
+          }
+          const stuckLong = ai.stuckHuntSince && (room._now - ai.stuckHuntSince) > 3.5;
+          if (parked && stuckLong && ai.cddOffense && room.isCDD && room.isCDD()) {
+            const enemyDisk = this._enemyDisk(team);
+            if (enemyDisk) { this._assignToDisk(sid, ai, s, ship, enemyDisk); return; }
+          }
           ai.role = 'hunt'; ai.targetId = flag.carrier; return;
         }
+        ai.stuckHuntSince = 0;
         // Teammate has the pod -> ESCORT: stay on the carrier and shoot whoever is chasing them.
         ai.role = 'escort'; ai.targetId = flag.carrier;
         // Prefer to actually FIRE at the nearest threat to the carrier if there is one in range.
@@ -358,7 +482,9 @@ export class DemoBots {
   _goalPoint(sid, ai, s, ship) {
     const room = this.room;
     const team = ship.team;
-    const flag = this._objectiveFlag(team);
+    // Honor a peel-off target (an offense bot that abandoned a stalled hunt for the enemy disk); else
+    // fly this bot's normal per-bot objective disk. Keeps the goal aligned with the assigned role.
+    const flag = ai.forceDisk || this._objectiveFlag(team, ai);
 
     // CARRY: I have the pod/disk -> beeline HARD for the score point (this is what captures). In CTC
     // that's my base center; in CDD it's my OWN disk's capture spot (return the enemy disk to it).
@@ -376,6 +502,23 @@ export class DemoBots {
       const carrier = ai.targetId && room.state.ships.get(ai.targetId);
       if (carrier && carrier.alive && carrier.carrying) {
         const d = this._dist(s.pos, { x: carrier.px, y: carrier.py, z: carrier.pz });
+        // PARKED-CARRIER STANDOFF: if the runner has holed up unreachable inside its own base, don't
+        // keep ramming the hull and looping. Hold a PICKET slot just OUTSIDE the base envelope on the
+        // line between the base center and the arena, so we cover the exit and pounce the instant the
+        // carrier pushes back out to score — a deliberate blockade instead of a useless orbit.
+        if (this._carrierParkedInBase(carrier)) {
+          const c = room.baseCenter(carrier.team);
+          const ox = -c.x, oy = -c.y, oz = -c.z;        // direction from base back toward arena center
+          const ol = Math.hypot(ox, oy, oz) || 1;
+          const reach = (typeof room.baseCollideRadius === 'function' ? room.baseCollideRadius(carrier.team) : 110) + 55;
+          // Fan pickets around the exit vector by this bot's stable slot so they don't stack up.
+          const px = c.x + (ox / ol) * reach + Math.cos(ai.slot) * 40;
+          const py = c.y + (oy / ol) * reach + Math.sin(ai.slot) * 40;
+          const pz = c.z + (oz / ol) * reach + Math.sin(ai.slot * 1.7) * 40;
+          const pd = this._dist(s.pos, { x: px, y: py, z: pz });
+          // Still shoot the carrier if it drifts into our sights while we hold the picket.
+          return { x: px, y: py, z: pz, dist: pd, shoot: true, targetShip: carrier, targetId: ai.targetId };
+        }
         // Aim for a PURSUIT SLOT, not the carrier's body. Far out we lead its motion to cut it off on
         // an intercept line; once we're close we aim for a point trailing just behind it along its
         // heading (its six o'clock) so we SETTLE onto its tail and hold a firing line — instead of
@@ -425,12 +568,61 @@ export class DemoBots {
     // on the pod, not on a ring around it. `precision` brakes the final approach into the 22u pickup
     // window; `grab` marks the committed grabbers so _think lines them up before feathering in.
     if (flag && !flag.carrier) {
+      const diskPos = { x: flag.px, y: flag.py, z: flag.pz };
+      const distToDisk = this._dist(s.pos, diskPos);
+
+      // --- BASE-HUGGING DISK: ride a clean radial lane, never straight through the hull -------------
+      // When the disk sits at/near a base (its home spot, or dropped against the hull), a straight run
+      // arcs into the base and the bot loops forever. Instead we build an OUTWARD approach waypoint on
+      // the base->disk radial and fly the lane: come in from the open side, line up on the radial, then
+      // commit to the disk. This alone kills the classic "bot circling its own disk at base" spin.
+      const near = this._diskNearBase(flag);
+      if (near) {
+        // Standoff waypoint sits further OUT along the radial than the disk, in clear space, so the bot
+        // approaches down the lane rather than skimming the hull tangentially.
+        const laneOut = near.reach + 120;
+        const wx = near.c.x + near.ux * laneOut;
+        const wy = near.c.y + near.uy * laneOut;
+        const wz = near.c.z + near.uz * laneOut;
+
+        // Am I lined up ON the lane? Project my offset-from-disk onto the outward radial: if I'm on the
+        // open side and roughly radial, I can commit straight to the disk; otherwise fly to the waypoint
+        // first to get onto the lane. This is what stops the tangential arc-around.
+        const mx = s.pos.x - flag.px, my = s.pos.y - flag.py, mz = s.pos.z - flag.pz;
+        const ml = Math.hypot(mx, my, mz) || 1;
+        const radialDot = (mx * near.ux + my * near.uy + mz * near.uz) / ml;  // 1 = dead on the open lane
+
+        // Anti-loop reset: if I've been orbiting close without seating the pickup, force a lane reset.
+        const orbiting = distToDisk < 200 && radialDot < 0.35;
+        if (orbiting) { if (!ai.grabLoopSince) ai.grabLoopSince = room._now; }
+        else ai.grabLoopSince = 0;
+        if (ai.grabLoopSince && (room._now - ai.grabLoopSince) > 1.6 && room._now >= ai.grabResetUntil) {
+          ai.grabResetUntil = room._now + 2.2;   // commit to the reset run for a beat so it actually clears
+        }
+        const resetting = room._now < ai.grabResetUntil;
+
+        // Fly to the lane waypoint when I'm not lined up (or I'm mid-reset); once on the open lane and
+        // close, bear straight down the radial into the disk with the precision brake.
+        const onLane = radialDot > 0.55 && !resetting;
+        if (!onLane) {
+          return { x: wx, y: wy, z: wz, dist: this._dist(s.pos, { x: wx, y: wy, z: wz }), shoot: false, targetShip: null, targetId: '', grab: ai.role === 'grab' };
+        }
+        // On the lane: aim slightly outboard of the disk so we settle onto it from the open side.
+        const seat = 10;
+        return {
+          x: flag.px + near.ux * seat, y: flag.py + near.uy * seat, z: flag.pz + near.uz * seat,
+          dist: distToDisk, shoot: false, targetShip: null, targetId: '', precision: true, grab: ai.role === 'grab',
+        };
+      }
+
+      // --- OPEN-SPACE DISK: original committed straight run with a small fan offset ------------------
+      ai.grabLoopSince = 0;
       const off = ai.role === 'grab' ? 0 : 18;   // committed grabbers aim dead-center; others fan slightly
       const ang = ai.fanAngle;   // FIXED per-bot angle -> a stable approach vector, not a drifting orbit
       const gx = flag.px + Math.cos(ang) * off;
       const gy = flag.py + Math.sin(ang * 0.7) * off * 0.4;
       const gz = flag.pz + Math.sin(ang) * off;
-      return { x: gx, y: gy, z: gz, dist: this._dist(s.pos, { x: flag.px, y: flag.py, z: flag.pz }), shoot: false, targetShip: null, targetId: '', precision: true, grab: ai.role === 'grab' };
+      return { x: gx, y: gy, z: gz, dist: distToDisk, shoot: false, targetShip: null, targetId: '', precision: true, grab: ai.role === 'grab' };
     }
 
     // Absolute fallback (no flag object): press toward arena center so bots never drift off alone.

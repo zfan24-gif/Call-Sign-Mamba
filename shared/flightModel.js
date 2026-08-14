@@ -201,14 +201,9 @@ export function stepShip(state, input, dt, speedScale = 1) {
   state.pos.y += state.vel.y * dt;
   state.pos.z += state.vel.z * dt;
 
-  // Soft arena boundary: nudge back toward center once well outside the leash radius.
-  const dist = Math.hypot(state.pos.x, state.pos.y, state.pos.z);
-  if (dist > FLIGHT.BOUNDARY) {
-    const over = dist - FLIGHT.BOUNDARY;
-    const nx = state.pos.x / dist, ny = state.pos.y / dist, nz = state.pos.z / dist;
-    const pull = over * FLIGHT.BOUNDARY_PULL * dt;
-    state.vel.x -= nx * pull; state.vel.y -= ny * pull; state.vel.z -= nz * pull;
-  }
+  // No soft arena boundary here: the multiplayer out-of-bounds mechanic is enforced authoritatively
+  // by ArenaRoom (a 10s countdown to destruction past FLIGHT.BOUNDARY). Prediction and the server
+  // integrator both fly straight and let the room own the boundary rule, so the two never diverge.
 }
 
 function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
