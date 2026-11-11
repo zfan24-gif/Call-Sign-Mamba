@@ -32,7 +32,13 @@ point the client at it via the `MP_ENDPOINT` constant in the game's `main.js`.
 - **Scoring / win.** Team opponent-kills are the Squadron Death Match win metric; the round clock
   decides the winner at 0.
 
-**Not yet implemented:** lag compensation, reconnection, additional game modes, score-limit wins.
+The arena supports FFA, Squadron Death Match, Capture the Cargo, Capture the Data Disk and Capital Ship Assault. Objective lobbies start with zero demo pilots. The host can opt into the demo squadron in the lobby.
+
+**Connection recovery.** An unexpected disconnect reserves the same Colyseus seat for 60 seconds. A returning pilot keeps their room, host identity, team, ship and scores. A deliberate exit releases the seat immediately. WebSocket ping/pong handles unresponsive transports independently of flight inputs. In Railway logs, correlate the room ID with the socket close code, unanswered pings, seat restoration or expiry.
+
+**Game and release verification.** The arena and its shared combat modules were synchronized from published Rosebud build `0d85ef05-87a3-4d82-a07e-d136893b00c0` of [Mamba - Ember Combat Workshop](https://rosebud.ai/play/mamba-ember-combat-workshop). When promoting a new game build, compare its `server-realtime/` files and imported shared modules with this repository. The browser client is released in the Rosebud project.
+
+Run `npm test` for game-rule regressions. The production `/health` response carries `X-CSM-Revision` when Railway supplies `RAILWAY_GIT_COMMIT_SHA`. Compare that value with the deployed branch head to verify the running binary.
 
 ## Run it locally
 
