@@ -1,3 +1,5 @@
+import { BOLT_SPEED, BOLT_LIFETIME, FIRE_COOLDOWN, MISSILE_LOCK_RANGE } from '../shared/combatHardware.js';
+import { segmentSphereTime } from '../shared/capitalFireControl.js';
 // ---- ArenaRoom: the authoritative 12v12 match room -------------------------------------------
 // This is the heart of the multiplayer server. It runs a FIXED-TIMESTEP simulation (30 Hz), owns
 // the true state of every ship, and streams state patches to all clients. Clients send only INPUT
@@ -31,11 +33,11 @@ const MAX_CLIENTS = MAX_PER_TEAM * 2;
 const INPUT_QUEUE_CAP = 8;          // per-player: cap buffered inputs so a flooding client can't grow memory
 
 // --- Combat tuning (all authoritative; clients only render the results) -----------------------
-const BOLT_SPEED = 520;             // units/sec — fast tracer
-const BOLT_LIFETIME = 1.6;          // seconds before a bolt expires
+             // units/sec — fast tracer
+          // seconds before a bolt expires
 const BOLT_DAMAGE = 12;             // damage per hit
 const BOLT_MUZZLE = 6;              // spawn this far ahead of the nose so we never self-collide
-const FIRE_COOLDOWN = 0.14;         // min seconds between a player's shots (server-enforced rate cap)
+         // min seconds between a player's shots (server-enforced rate cap)
 // Ship hit sphere radius (units). Sized to HUG the actual fighter hull rather than a generous aim
 // bubble, so a bolt only counts as a hit when it genuinely passes through the ship — not when it
 // sails visibly wide. Playable hulls are ~4.6-6.2 units long (see shipRoster.js `len`), giving a
@@ -108,7 +110,7 @@ const KILL_STREAK_REWARD_FFA = 2;   // kills-per-bonus-missile (Free-For-All)
 // MISSILE_LOCK_RANGE. Launch distance sets the seeker's turn authority: a close shot is agile and
 // hard to shake (MISSILE_TURN_NEAR), a shot near max range is sluggish and easy to out-turn
 // (MISSILE_TURN_FAR). This is defensive-flight evasion; chaff behavior is separate/unchanged.
-const MISSILE_LOCK_RANGE = 325;     // units — no homing lock can be acquired beyond this
+     // units — no homing lock can be acquired beyond this
 const MISSILE_TURN_NEAR = 3.1;      // rad/sec turn authority for a point-blank launch
 const MISSILE_TURN_FAR = 1.15;      // rad/sec turn authority for a launch near max range
 function missileTurnForRange(dist) {
@@ -201,9 +203,11 @@ const BASE_COLLIDE_PUSH = 2;       // extra separation (units) so a ship doesn't
 // float height + the CTC capture ring, so those stay anchored to the true hull envelope.
 const BASE_SOLID_CORE_TEAM = { 0: 40, 1: 62 };
 // Per-team helper: the OUTER hull-envelope radius (disk-home height + CTC capture ring reference).
-function baseCollideRadius(team) { return BASE_COLLIDE_RADIUS_TEAM[team] != null ? BASE_COLLIDE_RADIUS_TEAM[team] : BASE_COLLIDE_RADIUS; }
+// CAPITAL SHIP ASSAULT: blue fields the FSA Paladin, a hull sized like the IC Dreadnought, so both
+// capitals use the RED (260u) geometry for a mirror-balanced match. `csa` selects that symmetric set.
+function baseCollideRadius(team, csa = false) { if (csa) team = 1; return BASE_COLLIDE_RADIUS_TEAM[team] != null ? BASE_COLLIDE_RADIUS_TEAM[team] : BASE_COLLIDE_RADIUS; }
 // Per-team helper: the SOLID-CORE radius used for the authoritative collision push-out.
-function baseSolidCore(team) { return BASE_SOLID_CORE_TEAM[team] != null ? BASE_SOLID_CORE_TEAM[team] : BASE_COLLIDE_RADIUS; }
+function baseSolidCore(team, csa = false) { if (csa) team = 1; return BASE_SOLID_CORE_TEAM[team] != null ? BASE_SOLID_CORE_TEAM[team] : BASE_COLLIDE_RADIUS; }
 
 // Team spawn anchors: blue spawns on one side of the arena, red on the other. The anchors sit on
 // OPPOSITE diagonal corners, so the old "face ±Z" scheme aimed each ship straight down its own
@@ -233,14 +237,8 @@ const RESPAWN_CANDIDATES = 8;       // sample this many points, keep the safest 
 const FFA_SPAWN_RADIUS = 360;       // units from origin an FFA (re)spawn may scatter
 const FFA_SPAWN_CANDIDATES = 10;    // sample this many points, keep the safest (farthest from any rival)
 
-// Ghost reaper: a client that closed its tab, crashed, or dropped WiFi ungracefully doesn't always
-// trigger a prompt onLeave — Colyseus may hold the seat waiting for a clean close that never comes,
-// so the pilot lingers in the lobby/arena roster forever ("player stuck in the lobby that's no
-// longer playing"). We stamp each sim entry's lastSeen on every message and, in the tick, evict any
-// ship we haven't heard from in STALE_SHIP_TIMEOUT seconds. This self-heals ghosts no matter how the
-// client vanished. A LIVE client sends input every frame; even a lobby-idle client's UI polls the
-// server, so a healthy connection refreshes lastSeen well inside this window.
-const STALE_SHIP_TIMEOUT = 8;      // seconds of total silence before a ship is treated as a ghost and removed
+// WebSocket ping/pong detects dead transports independently of player input or rendering.
+const RECONNECT_GRACE_SECONDS = 60;
 
 export class ArenaRoom extends Room {
   onCreate(options) {
@@ -255,8 +253,7 @@ export class ArenaRoom extends Room {
     // increasing seq. We buffer it; the fixed tick consumes it. We validate/clamp on apply.
     this.onMessage('input', (client, msg) => {
       const s = this.sim.get(client.sessionId);
-      if (!s || !msg) return;
-      s.lastSeen = this._now;   // proof of life for the ghost reaper
+      if (!s || !msg || this.state.matchState === 'ended') return;
       // Guard against floods: keep only the most recent inputs.
       if (s.inputs.length >= INPUT_QUEUE_CAP) s.inputs.shift();
       s.inputs.push(sanitizeInput(msg));
@@ -276,7 +273,6 @@ export class ArenaRoom extends Room {
     this.onMessage('netprobe', (client, msg) => {
       const s = this.sim.get(client.sessionId);
       if (!s || !msg) return;
-      s.lastSeen = this._now;   // any probe echo is proof of life for the ghost reaper (before the id guard)
       if (!s._probe || (msg.id >>> 0) !== s._probe.id) return;   // ignore stale/forged ids for the RTT math
       const rttSample = Math.min(1, Math.max(0, (Date.now() - s._probe.sentMs) / 1000));
       s.rtt = s.rtt > 0 ? s.rtt * 0.8 + rttSample * 0.2 : rttSample;   // EMA so one late packet can't spike
@@ -288,12 +284,21 @@ export class ArenaRoom extends Room {
     // shooter's nose, and homes + damages it authoritatively. Rate-limited server-side.
     this.onMessage('missile', (client, msg) => this.tryFireMissile(client.sessionId, msg && msg.target));
 
+    // CSA: a client reports the authored hardpoint manifest of a loaded capital hull (the server has
+    // no GLB loader). CapitalAssault validates it and keeps the first good one per team.
+    this.onMessage('csaHardpoints', (client, msg) => {
+      if (!msg || !this.capitalAssault) return;
+      try {
+        if (this.capitalAssault.acceptManifest(Number(msg.team), msg.manifest)) {
+          console.log(`[CSA] authored hardpoints accepted for team ${msg.team} (from ${client.sessionId})`);
+        }
+      } catch (err) { console.warn('[CSA] bad hardpoint manifest', err && err.message); }
+    });
+
     // VOICE PRESENCE (transport-agnostic): the client reports push-to-talk state. We only replicate a
     // `speaking` flag so every pilot can render who's on the radio; the actual audio rides a separate
     // WebRTC/SFU layer. We DON'T rate-limit this (it's a low-frequency edge event: pressed / released).
     this.onMessage('voice', (client, msg) => {
-      const s = this.sim.get(client.sessionId);
-      if (s) s.lastSeen = this._now;   // interaction heartbeat
       const ship = this.state.ships.get(client.sessionId);
       if (!ship) return;
       ship.speaking = !!(msg && msg.talking);
@@ -342,8 +347,8 @@ export class ArenaRoom extends Room {
       // Anything else is ignored.
       // Early Access gate: reject modes that aren't shippable in this build (see EA_ALLOWED_MODES).
       if ((msg.mode === 'sdm' || msg.mode === 'ffa' || msg.mode === 'ctc' || msg.mode === 'cdd' || msg.mode === 'csa') && eaModeAllowed(msg.mode)) this.state.mode = msg.mode;
-      // DEMO-ONLY (REMOVE BEFORE SHIP): arm the AI squadron when the host selects CTC in the lobby,
-      // and tear it down if they switch back to another mode so SDM/FFA stay pure-human.
+      // Demo pilots are a host opt-in for objective modes. A fresh room is player-only.
+      if (typeof msg.demoBotsEnabled === 'boolean') this.state.demoBotsEnabled = msg.demoBotsEnabled;
       this.maybeArmDemoBots();
       const d = Number(msg.roundDuration);
       // Accept a real timed round from the whitelist, OR the INFINITE sentinel (0) but ONLY in an
@@ -371,7 +376,7 @@ export class ArenaRoom extends Room {
     this.onMessage('setShip', (client, msg) => {
       const ship = this.state.ships.get(client.sessionId);
       const s = this.sim.get(client.sessionId);
-      if (!ship || !s || !msg) return;
+      if (!ship || !s || !msg || this.state.matchState === 'ended') return;
       // FFA: any of the 6 hulls is legal (team=-1 skips the filter). SDM: team-filtered.
       const shipId = sanitizeShip(msg.ship, this.isFFA() ? -1 : ship.team);
       if (shipId === ship.ship) return;
@@ -395,8 +400,6 @@ export class ArenaRoom extends Room {
     // READY-CHECK: any pilot toggles their own ready flag in the lobby. Replicated so every lobby
     // shows the live ready pips. Only meaningful in the lobby; a ready flag set mid-round is harmless.
     this.onMessage('setReady', (client, msg) => {
-      const s = this.sim.get(client.sessionId);
-      if (s) s.lastSeen = this._now;   // interaction heartbeat
       const ship = this.state.ships.get(client.sessionId);
       if (!ship) return;
       ship.ready = !!(msg && msg.ready);
@@ -419,10 +422,7 @@ export class ArenaRoom extends Room {
     this._collideCd = new Map(); // "sidA|sidB" -> sim time a ram-pair may next collide-damage
 
     // ---- DEMO-ONLY (REMOVE BEFORE SHIP) ------------------------------------------------------
-    // AI squadron filler. Armed automatically the moment a human host runs a CTC lobby (see
-    // maybeArmDemoBots), so recording the demo needs no extra clicks. Bots are namespaced `bot:`
-    // and live in state.ships + sim, so every combat/collision/cargo/scoring loop treats them as
-    // players. Cleared when leaving CTC, at match start, and on dispose.
+    // Objective-mode demo pilots join only after an explicit host selection.
     this.demoBots = DEMO_BOTS ? new DemoBots(this) : null;
 
     // Capital Ship Assault controller: owns the two capitals' destructible emplacements (cannons +
@@ -499,13 +499,13 @@ export class ArenaRoom extends Room {
   // A team's OUTER base collision radius (the envelope that governs the disk-home height + capture
   // ring). Exposed as a method so helper modules (the demo bots) can read the authoritative base
   // geometry instead of hard-coding a guess when deciding if a carrier is unreachable inside its base.
-  baseCollideRadius(team) { return baseCollideRadius(team); }
+  baseCollideRadius(team) { return baseCollideRadius(team, this.isCSA()); }
 
   // A team's SOLID-CORE radius — the tight inner sphere a bolt actually can't pass through (a ship
   // can physically fly right up to it). CSA cannon line-of-sight uses this against the FIRING
   // cannon's own hull so a pilot hugging the hull (inside the loose outer envelope but outside the
   // solid body) is still a valid target instead of being falsely "blocked by our own ship".
-  baseSolidCore(team) { return baseSolidCore(team); }
+  baseSolidCore(team) { return baseSolidCore(team, this.isCSA()); }
 
   // The SINGLE neutral pod's HOME rest position: the arena CENTER (origin), the exact midpoint
   // between the two bases, so both teams have an equal run for it.
@@ -536,12 +536,13 @@ export class ArenaRoom extends Room {
     if (!this.demoBots) return;
     // Arm the demo squadron for any objective mode that benefits from a lively staged match (both
     // capture modes AND Capital Ship Assault). Pure-human SDM/FFA get no bots.
-    const wantsBots = this.isCargoMode() || this.isCSA();
+    const wantsBots = this.state.demoBotsEnabled && (this.isCargoMode() || this.isCSA());
     if (wantsBots && this.state.matchState === 'lobby') this.demoBots.arm();
     else if (!wantsBots) this.demoBots.clear();
   }
 
   onJoin(client, options) {
+    this.observeClose(client);
     const ffa = this.isFFA();
     // FFA has no teams. We still assign team 0 for schema tidiness, but pass team=-1 to sanitizeShip
     // so ANY of the 6 hulls is legal, and combat/scoring treat everyone as a lone rival.
@@ -601,7 +602,6 @@ export class ArenaRoom extends Room {
       quat: { x: ship.qx, y: ship.qy, z: ship.qz, w: ship.qw },
       inputs: [],
       lastSeq: 0,
-      lastSeen: this._now,   // last time we heard ANY message from this client (ghost-reaper watchdog)
       // Combat scratch (server-only, never replicated):
       fireCd: 0,        // seconds remaining until this player can fire again
       missileCd: 0,     // seconds remaining until this player can launch another missile
@@ -626,13 +626,46 @@ export class ArenaRoom extends Room {
     console.log(`[arena] ${name} joined as ${team === 0 ? 'BLUE' : 'RED'} (${this.state.blueCount}v${this.state.redCount}) [roomId=${this.roomId}, clients=${this.clients.length}]`);
   }
 
-  onLeave(client) {
-    this.removeShip(client.sessionId);
+  async onLeave(client, consented) {
+    const sid = client.sessionId;
+    const ship = this.state.ships.get(sid);
+    if (!ship) return;
+    if (!consented) {
+      // Keep this ship in the simulation and susceptible to damage. Clear held
+      // controls and drop carried objectives so a missing pilot cannot fly or score.
+      ship.connected = false;
+      ship.speaking = false;
+      const sim = this.sim.get(sid);
+      sim.inputs.length = 0;
+      sim.lastInput = IDLE_INPUT;
+      sim._probe = null;
+      if (ship.carrying && this.isCTC()) this.dropCargoFrom(sid, ship.px, ship.py, ship.pz);
+      if (ship.carrying && this.isCDD()) this.dropDiskFrom(sid, ship.px, ship.py, ship.pz, false);
+      console.info('[arena] connection lost', { room: this.roomId, pilot: sid, phase: this.state.matchState, grace: RECONNECT_GRACE_SECONDS });
+      try {
+        const restored = await this.allowReconnection(client, RECONNECT_GRACE_SECONDS);
+        ship.connected = true;
+        this.observeClose(restored);
+        console.info('[arena] seat restored', { room: this.roomId, pilot: sid });
+        return;
+      } catch {
+        console.info('[arena] seat expired', { room: this.roomId, pilot: sid });
+      }
+    }
+    this.removeShip(sid);
+  }
+
+  observeClose(client) {
+    // The room lifecycle exposes only a consent flag in Colyseus 0.15. Capture
+    // the wire close code as well, without logging tokens or request URLs.
+    client.ref?.once?.('close', code => {
+      console.info('[arena] socket closed', { room: this.roomId, pilot: client.sessionId, code, unansweredPings: client.ref?.pingCount ?? null });
+    });
   }
 
   // Fully evict a pilot from the room: drop the replicated ship, the server-side sim scratch, any
   // bolts/missiles tied to them, and reassign the host if they held it. Shared by the clean-leave
-  // path (onLeave) and the ghost reaper (a client that vanished without a clean disconnect), so a
+  // path and an expired reconnection reservation, so a
   // stuck lobby/arena entry is removed the same way no matter how the pilot left.
   removeShip(sessionId) {
     const ship = this.state.ships.get(sessionId);
@@ -658,7 +691,10 @@ export class ArenaRoom extends Room {
     // still be configured/started. Empties to '' when the room drains.
     if (this.state.host === sessionId) {
       let next = '';
-      for (const sid of this.state.ships.keys()) { next = sid; break; }
+      for (const [sid, pilot] of this.state.ships) {
+        if (!sid.startsWith('bot:') && pilot.connected !== false) { next = sid; break; }
+      }
+      if (!next) next = [...this.state.ships.keys()].find(id => !id.startsWith('bot:')) || '';
       this.state.host = next;
     }
   }
@@ -666,20 +702,8 @@ export class ArenaRoom extends Room {
   // One authoritative simulation step: move ships, regen shields, advance bolts + hit-detect, and
   // process death/respawn. Everything here is server truth; clients only render the replicated state.
   tick() {
+    if (this.state.matchState === 'ended') return;
     this._now += FIXED_DT;
-
-    // --- 0a) Ghost reaper -------------------------------------------------------------------------
-    // Evict any pilot we haven't heard from in STALE_SHIP_TIMEOUT seconds. lastSeen is refreshed by
-    // every input AND every netprobe echo (~2/sec on a healthy connection), so a live pilot — even
-    // one idling in the lobby — never trips this, while a client that closed its tab, crashed, or
-    // dropped its connection ungracefully (and never fired a clean onLeave) is cleaned out here.
-    for (const [sid, s] of this.sim) {
-      if (this._now - (s.lastSeen || 0) > STALE_SHIP_TIMEOUT) {
-        const ship = this.state.ships.get(sid);
-        console.log(`[arena] reaping ghost pilot ${ship ? ship.name : sid} (silent ${STALE_SHIP_TIMEOUT}s) [roomId=${this.roomId}]`);
-        this.removeShip(sid);
-      }
-    }
 
     // --- 0) Round clock (Squadron Death Match) ------------------------------------------------
     // Only counts while the match is LIVE. Decrement toward 0, clamp at 0 (never go negative), and
@@ -694,6 +718,7 @@ export class ArenaRoom extends Room {
       if (this.state.timeLeft <= 0) {
         this.state.timeLeft = 0;
         this.endMatch();
+        return;
       }
     }
 
@@ -907,8 +932,8 @@ export class ArenaRoom extends Room {
     // through an OPEN launch bay isn't rubber-banded back out; the client's point-in-mesh probe does
     // the fine-grained near-hull collision for the solid sections.
     const bases = [
-      { c: this.baseCenter(0), r: baseSolidCore(0) },
-      { c: this.baseCenter(1), r: baseSolidCore(1) },
+      { c: this.baseCenter(0), r: baseSolidCore(0, this.isCSA()) },
+      { c: this.baseCenter(1), r: baseSolidCore(1, this.isCSA()) },
     ];
     for (const [sid, ship] of this.state.ships) {
       if (!ship.alive) continue;
@@ -938,6 +963,7 @@ export class ArenaRoom extends Room {
 
   // Attempt to fire from `sessionId`: authoritative rate-limit + spawn a bolt down the nose.
   tryFire(sessionId) {
+    if (this.state.matchState === 'ended') return;
     const ship = this.state.ships.get(sessionId);
     const s = this.sim.get(sessionId);
     if (!ship || !s || !ship.alive) return;
@@ -966,6 +992,7 @@ export class ArenaRoom extends Room {
   // target is a live hostile, rate-limits, and spawns a homing missile from the shooter's nose. A
   // missing/invalid target degrades to a dumbfire missile that flies straight (target = '').
   tryFireMissile(sessionId, targetId) {
+    if (this.state.matchState === 'ended') return;
     const ship = this.state.ships.get(sessionId);
     const s = this.sim.get(sessionId);
     if (!ship || !s || !ship.alive) return;
@@ -1008,6 +1035,24 @@ export class ArenaRoom extends Room {
     const id = 'm' + (++this._missileSeq);
     m._ttl = MISSILE_LIFETIME;
     this.state.missiles.set(id, m);
+  }
+
+  // CSA authored launcher: spawn a guided missile owned by a capital ('cap:<team>'). Returns true if
+  // launched. Same seeker, speed, fuse and damage as a pilot's missile.
+  spawnCapitalMissile(team, from, dir, targetId, range, damage = 34) {
+    if (this.state.missiles.size >= MAX_MISSILES) return false;
+    const m = new Missile();
+    m.owner = 'cap:' + team; m._damage = damage;
+    m.team = team;
+    m.target = targetId || '';
+    m._turn = missileTurnForRange(range || 200);
+    m.px = from.x + dir.x * MISSILE_MUZZLE;
+    m.py = from.y + dir.y * MISSILE_MUZZLE;
+    m.pz = from.z + dir.z * MISSILE_MUZZLE;
+    m.vx = dir.x * MISSILE_SPEED; m.vy = dir.y * MISSILE_SPEED; m.vz = dir.z * MISSILE_SPEED;
+    m._ttl = MISSILE_LIFETIME;
+    this.state.missiles.set('m' + (++this._missileSeq), m);
+    return true;
   }
 
   // Home every missile toward its locked target (turn-rate limited), advance it, and proximity-fuse
@@ -1063,17 +1108,18 @@ export class ArenaRoom extends Room {
         }
       }
 
+      const from = { x: m.px, y: m.py, z: m.pz }, end = { x: nx, y: ny, z: nz };
+      let first = Infinity, hit = null;
       for (const [sid, ship] of this.state.ships) {
-        if (!ship.alive) continue;
-        if (sid === m.owner) continue;
-        if (!ffa && ship.team === m.team) continue;   // SDM: no friendly fuse (FFA: everyone but the owner)
-        if (segmentHitsSphere(m.px, m.py, m.pz, nx, ny, nz, ship.px, ship.py, ship.pz, MISSILE_HIT_RADIUS)) {
-          this.damageShip(sid, ship, MISSILE_DAMAGE, m.owner);
-          // Broadcast so clients can render a big warhead blast at the impact point.
-          this.broadcast('missileHit', { x: ship.px, y: ship.py, z: ship.pz, owner: m.owner, victim: sid });
-          consumed = true;
-          break;
-        }
+        if (!ship.alive || sid === m.owner || (!ffa && ship.team === m.team)) continue;
+        const time = segmentSphereTime(from, end, { x: ship.px, y: ship.py, z: ship.pz }, MISSILE_HIT_RADIUS);
+        if (time !== null && time < first) { first = time; hit = { sid, ship }; }
+      }
+      if (hit) {
+        this.damageShip(hit.sid, hit.ship, m._damage ?? MISSILE_DAMAGE, m.owner);
+        this.broadcast('missileHit', { x: from.x + (nx - from.x) * first, y: from.y + (ny - from.y) * first,
+          z: from.z + (nz - from.z) * first, owner: m.owner, victim: hit.sid });
+        consumed = true;
       }
 
       if (consumed || m._ttl <= 0) {
@@ -1111,22 +1157,24 @@ export class ArenaRoom extends Room {
           continue;
         }
       }
-      // Swept collision: closest approach of the segment (bolt.p -> n) to each enemy ship center.
+      const from = { x: bolt.px, y: bolt.py, z: bolt.pz }, end = { x: nx, y: ny, z: nz };
+      let hit = null, first = Infinity;
       for (const [sid, ship] of this.state.ships) {
-        if (!ship.alive) continue;
-        if (sid === bolt.owner) continue;       // never hit the shooter
-        if (!ffa && ship.team === bolt.team) continue;  // SDM: no friendly fire (FFA: everyone's a target)
-        // Test against the target's REWOUND center (its position at the shooter's view time), not its
-        // live center — this is what makes a well-aimed shot at a moving target actually connect.
+        if (!ship.alive || sid === bolt.owner || (!bolt.capital && !ffa && ship.team === bolt.team)) continue;
         const tsim = this.sim.get(sid);
-        this.rewoundCenter(tsim, ship, rewind, rewound);
-        if (segmentHitsSphere(bolt.px, bolt.py, bolt.pz, nx, ny, nz, rewound.x, rewound.y, rewound.z, HIT_RADIUS)) {
-          // Damage scales with the SHOOTER's firepower multiplier (heavier hulls hit harder).
-          const dmg = BOLT_DAMAGE * (shooterSim && shooterSim.firepower ? shooterSim.firepower : 1);
-          this.damageShip(sid, ship, dmg, bolt.owner);
-          consumed = true;
-          break;
-        }
+        if (bolt.capital) Object.assign(rewound, { x: ship.px, y: ship.py, z: ship.pz });
+        else this.rewoundCenter(tsim, ship, rewind, rewound);
+        const time = segmentSphereTime(from, end, rewound, HIT_RADIUS);
+        if (time !== null && time < first) { first = time; hit = { sid, ship }; }
+      }
+      if (bolt.capital && this.isCSA()) {
+        const cover = this.capitalAssault.coverTime(from, end, bolt.team);
+        if (cover !== null && cover <= first) { hit = null; consumed = true; }
+      }
+      if (hit) {
+        const dmg = bolt.capital ? (bolt._damage ?? 8) : BOLT_DAMAGE * (shooterSim?.firepower || 1);
+        if (ffa || hit.ship.team !== bolt.team) this.damageShip(hit.sid, hit.ship, dmg, bolt.owner);
+        consumed = true;
       }
 
       if (consumed || bolt._ttl <= 0) {
@@ -1223,7 +1271,7 @@ export class ArenaRoom extends Room {
       // --- Loose or center pod: the closest pilot of EITHER team within pickup range grabs it -----
       let claimedBy = null, nearestPickup = CARGO_PICKUP_RADIUS * CARGO_PICKUP_RADIUS;
       this.state.ships.forEach((ship, sid) => {
-        if (!ship.alive || ship.carrying) return;
+        if (ship.connected === false || !ship.alive || ship.carrying) return;
         const s = this.sim.get(sid);
         if (!s) return;
         const dx = s.pos.x - pod.px, dy = s.pos.y - pod.py, dz = s.pos.z - pod.pz;
@@ -1253,6 +1301,7 @@ export class ArenaRoom extends Room {
   // Award a capture to the carrier's team, reset the pod home, and end the match if the team has
   // reached the capture target. Broadcasts a 'capture' event for client feedback (banner + SFX).
   scoreCapture(carrier, pod) {
+    if (this.state.matchState !== 'live') return;
     const team = carrier.team;
     if (team === 0) this.state.blueCaptures = (this.state.blueCaptures + 1) & 0xffff;
     else this.state.redCaptures = (this.state.redCaptures + 1) & 0xffff;
@@ -1407,7 +1456,7 @@ export class ArenaRoom extends Room {
       // --- Home or loose disk: the nearest eligible ENEMY pilot within pickup range grabs it -------
       let claimedBy = null, nearestPickup = CDD_PICKUP_RADIUS * CDD_PICKUP_RADIUS;
       this.state.ships.forEach((ship, sid) => {
-        if (!ship.alive || ship.carrying) return;    // one disk per pilot
+        if (ship.connected === false || !ship.alive || ship.carrying) return;    // one disk per pilot
         if (ship.team === ownerTeam) return;         // you cannot pick up your OWN team's disk
         const s = this.sim.get(sid);
         if (!s) return;
@@ -1441,6 +1490,7 @@ export class ArenaRoom extends Room {
   // existing HUD banner/score feedback works unchanged) and a 'diskCapture' event carrying the disk
   // allegiance for the CDD score VO matrix.
   scoreDiskCapture(carrier, disk) {
+    if (this.state.matchState !== 'live') return;
     const team = carrier.team;
     if (team === 0) this.state.blueCaptures = (this.state.blueCaptures + 1) & 0xffff;
     else this.state.redCaptures = (this.state.redCaptures + 1) & 0xffff;
@@ -1473,6 +1523,7 @@ export class ArenaRoom extends Room {
   // Broadcasts a 'hit' event so BOTH the shooter (hit-marker "you connected") and the victim
   // (damage flash / "you're taking fire") get immediate feedback, independent of the kill event.
   damageShip(sid, ship, dmg, attackerId) {
+    if (this.state.matchState === 'ended') return;
     const s = this.sim.get(sid);
     if (s) s.lastHitAt = this._now;
     const shieldHit = ship.shields > 0;   // did the shot land on shields (vs bare hull)?
@@ -1495,6 +1546,7 @@ export class ArenaRoom extends Room {
   // Destroy a ship: mark dead, bump scoreboards, schedule respawn, and broadcast a kill event so
   // clients can play an explosion + feed message.
   killShip(sid, ship, attackerId) {
+    if (this.state.matchState === 'ended') return;
     ship.alive = false;
     ship.hull = 0;
     ship.shields = 0;
@@ -1511,7 +1563,9 @@ export class ArenaRoom extends Room {
     const s = this.sim.get(sid);
     if (s) s.respawnAt = this._now + RESPAWN_DELAY;
     const killer = this.state.ships.get(attackerId);
-    if (killer && attackerId !== sid) {
+    const credited = !!killer && attackerId !== sid && (this.isFFA() || killer.team !== ship.team);
+    let missileResupply = 0;
+    if (credited) {
       killer.kills = (killer.kills + 1) & 0xffff;
       // MISSILE RESUPPLY: every KILL_STREAK_REWARD confirmed kills THIS LIFE tops the killer's rack
       // up by one, capped at their hull's capacity. Authoritative, so a client can't fake the reward.
@@ -1522,7 +1576,10 @@ export class ArenaRoom extends Room {
         const reward = this.isFFA() ? KILL_STREAK_REWARD_FFA : KILL_STREAK_REWARD;
         if (ks.killStreak % reward === 0) {
           const cap = killer.maxMissiles || ks.maxMissiles || 4;
-          if (killer.missiles < cap) killer.missiles = Math.min(cap, killer.missiles + 1);
+          if (killer.missiles < cap) {
+            killer.missiles++;
+            missileResupply = 1;
+          }
         }
       }
       // Credit the win metric. SDM tallies opponent kills per TEAM (blue vs red); FFA has no teams,
@@ -1533,10 +1590,13 @@ export class ArenaRoom extends Room {
         else this.state.redKills = (this.state.redKills + 1) & 0xffff;
       }
     }
+    const capitalTeam = attackerId === 'cap:0' ? 0 : attackerId === 'cap:1' ? 1 : -1;
+    const cannonName = capitalTeam === 0 ? 'FSA CAPITAL CANNON' : capitalTeam === 1 ? 'IRON COALITION CAPITAL CANNON' : '';
     this.broadcast('kill', {
+      credited, missileResupply,
       victim: sid, victimName: ship.name, victimTeam: ship.team,
-      killer: attackerId, killerName: killer ? killer.name : '',
-      killerTeam: killer ? killer.team : -1,
+      killer: attackerId, killerName: killer ? killer.name : cannonName,
+      killerTeam: killer ? killer.team : capitalTeam,
       x: ship.px, y: ship.py, z: ship.pz,
     });
   }
@@ -1713,7 +1773,7 @@ export class ArenaRoom extends Room {
     let any = false;
     for (const ship of this.state.ships.values()) {
       any = true;
-      if (!ship.ready) return false;
+      if (!ship.ready || ship.connected === false) return false;
     }
     return any;
   }
@@ -1763,6 +1823,8 @@ export class ArenaRoom extends Room {
   endMatch() {
     if (this.state.matchState !== 'live') return;
     this.state.matchState = 'ended';
+    this.state.bolts.clear();
+    this.state.missiles.clear();
 
     if (this.isFFA()) {
       // FFA: the winner is the single pilot with the most kills. Ties (or nobody scoring) leave the
@@ -1781,6 +1843,7 @@ export class ArenaRoom extends Room {
       this.broadcast('matchEnd', {
         mode: 'ffa',
         winnerId: topId, winnerName: topName, winnerKills: topKills,
+        tiedNames: tie ? [...this.state.ships.values()].filter(p => p.kills === topKills).map(p => p.name) : [],
       });
       console.log(`[arena] FFA MATCH END — winner=${topName || 'DRAW'} (${topKills} kills) [roomId=${this.roomId}]`);
       return;

@@ -18,41 +18,65 @@
 // origin), so server hit-tests and client renders line up without the client raycasting the GLB.
 
 import { Emplacement, Bolt } from './schema.js';
+import { updateCapitalFireControl, interceptPoint, segmentSphereTime } from '../shared/capitalFireControl.js';
 
 // --- Capital geometry (must mirror the client's CTC_BASE_CENTER + capital lengths) ---------------
 // The two capitals sit at the spread team-base centers (room.baseCenter) and face the arena origin.
 // Their NOMINAL lengths match scene.js: blue flagship ~140u, red capital ~260u. Mounts below are
 // fractions of these so cannons/gens spread realistically along each different-sized hull.
-const CAP_LEN = { 0: 140, 1: 260 };   // 0 = blue flagship, 1 = red capital (client scene.js lengths)
+// CSA: blue fields the FSA Paladin (sized like the IC Dreadnought), so both hulls are 260u and carry
+// the IDENTICAL emplacement layout below (2 shield gens + the same cannon set) — a mirror match.
+const CAP_LEN = { 0: 260, 1: 260 };   // 0 = FSA Paladin, 1 = IC Dreadnought (client scene.js lengths)
 
-// --- Cannon tuning -------------------------------------------------------------------------------
-const CANNON_RANGE = 250;          // only engage an enemy ship within this many units ("250M")
-const CANNON_TURN = 1.6;           // rad/sec the aim point can slew toward a new target (visual only)
-const CANNON_BOLT_SPEED = 340;     // units/sec — heavier/slower-reading than a fighter tracer (520)
-const CANNON_BOLT_TTL = 12;        // seconds a capital bolt persists (fighter bolts live ~1.6s) so it
-                                   // travels ~4000u — well off the battlefield before it expires
-const CANNON_DAMAGE = 16;          // per-hit; a capital connecting occasionally is a real threat
-const CANNON_BURST_MIN = 3;        // shots per burst (3-5)
-const CANNON_BURST_MAX = 5;
-const CANNON_SHOT_GAP = 0.11;      // seconds between shots WITHIN a burst
-const CANNON_BURST_COOLDOWN_MIN = 1.8;   // seconds between bursts (per cannon)
+// Firing cadence, lead, traverse, range and damage come from shared/capitalFireControl.js.
+// These constants retain authored mount health/geometry and initial spawn staggering.
+const CANNON_BURST_COOLDOWN_MIN = 1.8;
 const CANNON_BURST_COOLDOWN_MAX = 3.4;
-// Deliberately IMPERFECT aim: cannons scatter their bolts by this cone (radians) so they only
-// occasionally connect while human pilots fight each other — the spec calls for "not deadly
-// accurate ... although a capital can occasionally connect".
-const CANNON_SPREAD = 0.055;
-// Fire-arc gate: a cannon only opens up when the target is within this dot of its outward mount
-// normal, i.e. roughly on the side of the hull the cannon actually faces. Combined with the LOS
-// gate below, this keeps a cannon from firing "backward" through its own ship.
 const CANNON_ARC_DOT = -0.1;       // generous (~95deg off-normal) — the LOS test does the real gating
 const CANNON_HP = 520;             // tanky: takes a fair amount of fire to destroy (spec)
 const SHIELDGEN_HP = 900;          // shield generators are tough too — clearing them is the objective
+// --- Authored missile launchers (from the hull GLB's MT_n / MISSILE_NN turrets) -------------------
+const LAUNCHER_HP = 600;
+
+// Validate + normalize a client-submitted hardpoint manifest. Rejects anything malformed or
+// implausible (wrong sizes, non-finite numbers, parts far outside a 260u hull) so a tampered client
+// can't plant guns in open space or bloat the room.
+const finite = (n) => typeof n === 'number' && Number.isFinite(n);
+const vec3 = (v, lim) => Array.isArray(v) && v.length === 3 && v.every(n => finite(n) && Math.abs(n) <= lim) ? v.map(Number) : null;
+function sanitizeManifest(m) {
+  if (!m || typeof m !== 'object' || !Array.isArray(m.turrets) || !Array.isArray(m.shieldgens)) return null;
+  if (m.turrets.length > 24 || m.shieldgens.length > 8 || m.shieldgens.length < 1) return null;
+  const HULL = 220;   // generous half-extent for a 260u-class capital
+  const id = (s) => typeof s === 'string' && /^[A-Za-z0-9_]{1,32}$/.test(s) ? s : null;
+  const turrets = [];
+  for (const t of m.turrets) {
+    if (!t || !t.tf) return null;
+    const out = {
+      id: id(t.id), kind: t.kind === 'missile' ? 'missile' : 'laser',
+      pivot: vec3(t.pivot, HULL), aim: vec3(t.aim, HULL),
+      tf: { fwd: vec3(t.tf.fwd, 1.01), side: vec3(t.tf.side, 1.01), up: vec3(t.tf.up, 1.01) },
+      pitchMin: finite(t.pitchMin) ? clamp(t.pitchMin, -Math.PI / 2, Math.PI / 2) : -0.2618,
+      pitchMax: finite(t.pitchMax) ? clamp(t.pitchMax, -Math.PI / 2, Math.PI / 2) : Math.PI / 2,
+      arc: Array.isArray(t.arc) && t.arc.length === 72 && t.arc.every(finite) ? t.arc.map(Number) : null,
+      muzzles: Array.isArray(t.muzzles) ? t.muzzles.slice(0, 8).map(v => vec3(v, 40)).filter(Boolean) : [],
+      radius: finite(t.radius) ? clamp(t.radius, 1, 20) : 4,
+    };
+    if (!out.id || !out.pivot || !out.aim || !out.tf.fwd || !out.tf.side || !out.tf.up) return null;
+    turrets.push(out);
+  }
+  const shieldgens = [];
+  for (const s of m.shieldgens) {
+    const out = { id: id(s && s.id), pos: vec3(s && s.pos, HULL), radius: s && finite(s.radius) ? clamp(s.radius, 2, 30) : 8 };
+    if (!out.id || !out.pos) return null;
+    shieldgens.push(out);
+  }
+  return { turrets, shieldgens };
+}
 
 // --- Shield deflection (mirrors single-player capitalDamageMult) ---------------------------------
 // While generators live, the hull barely takes damage; both down = full damage.
 function hullDamageMult(liveGens) {
-  if (liveGens >= 2) return 0.03;
-  if (liveGens === 1) return 0.18;
+  if (liveGens > 0) return 0;
   return 1;
 }
 
@@ -74,6 +98,20 @@ function segPointDist2(x0, y0, z0, x1, y1, z1, cx, cy, cz) {
   return px * px + py * py + pz * pz;
 }
 
+// Project the segment into the capital's local, unit-sized hull. The larger
+// spherical docking envelope would cover the exposed dorsal and ventral mounts.
+function hullEntry(pose, from, to) {
+  const normalize = point => {
+    const offset = sub(point, pose.center);
+    return {
+      x: dot(offset, pose.right) / (pose.len * 0.16),
+      y: dot(offset, pose.up) / (pose.len * 0.05),
+      z: dot(offset, pose.zAxis) / (pose.len * 0.48),
+    };
+  };
+  return segmentSphereTime(normalize(from), normalize(to), { x: 0, y: 0, z: 0 }, 1);
+}
+
 export class CapitalAssault {
   constructor(room) {
     this.room = room;
@@ -82,6 +120,7 @@ export class CapitalAssault {
     this._caps = { 0: null, 1: null };   // { center, quat, len } per team
     this._emp = new Map();               // key -> { kind, capTeam, worldPos, normalWorld, ...cannonScratch }
     this._boltSeq = 0;
+    this._fireGroups = {}; this._fireTargets = new Map();
   }
 
   // Build both capitals' emplacements + reset hull integrity. Called from room.startMatch() for CSA.
@@ -98,6 +137,7 @@ export class CapitalAssault {
     this.active = false;
     for (const key of [...this.room.state.emplacements.keys()]) this.room.state.emplacements.delete(key);
     this._emp.clear();
+    this._fireGroups = {}; this._fireTargets.clear();
     this._caps = { 0: null, 1: null };
   }
 
@@ -166,9 +206,101 @@ export class CapitalAssault {
     ];
   }
 
+  // ---- Authored hardpoints (from the hull GLB, via a client-submitted manifest) ----------------
+  // The server can't load GLBs, so a client sends the manifest its loaded capital produced
+  // (hardpoints.js, already converted to THIS capital frame). We validate it hard, cache it for the
+  // room's lifetime (the hulls never change), and rebuild that team's emplacements from it as long
+  // as none of them has been damaged yet. Afterwards every turret / launcher / shield gen is the
+  // real part on the model — the generic fraction layout below is only the pre-manifest fallback.
+  acceptManifest(team, manifest) {
+    if (team !== 0 && team !== 1) return false;
+    if (this._manifests && this._manifests[team]) return false;     // first good one wins
+    const clean = sanitizeManifest(manifest);
+    if (!clean) return false;
+    this._manifests = this._manifests || { 0: null, 1: null };
+    this._manifests[team] = clean;
+    if (this.active && !this._teamTouched(team)) this._rebuildTeam(team);
+    return true;
+  }
+  _teamTouched(team) {
+    for (const s of this._emp.values()) if (s.capTeam === team && s.e.hp < s.e.maxHp) return true;
+    return false;
+  }
+  _rebuildTeam(team) {
+    for (const key of [...this._emp.keys()]) {
+      const s = this._emp.get(key);
+      if (s.capTeam !== team) continue;
+      this._emp.delete(key);
+      this.room.state.emplacements.delete(key);
+    }
+    this._buildCapital(team);
+  }
+  _buildAuthored(team, pose, man) {
+    let idx = 0;
+    const add = (kind, part, local, normal, hp, extra) => {
+      const key = team + ':' + (idx++);
+      const e = new Emplacement();
+      e.capTeam = team; e.kind = kind; e.part = part;
+      e.lx = local[0]; e.ly = local[1]; e.lz = local[2];
+      const n = norm({ x: normal[0], y: normal[1], z: normal[2] });
+      e.nx = n.x; e.ny = n.y; e.nz = n.z;
+      e.hp = hp; e.maxHp = hp; e.alive = true; e.firing = false;
+      const worldPos = this._localToWorld(pose, local[0], local[1], local[2]);
+      e.aimX = worldPos.x; e.aimY = worldPos.y; e.aimZ = worldPos.z;
+      this.room.state.emplacements.set(key, e);
+      this._emp.set(key, Object.assign({
+        key, kind, capTeam: team, e, worldPos,
+        normalWorld: this._localDirToWorld(pose, n.x, n.y, n.z),
+        cooldown: CANNON_BURST_COOLDOWN_MIN + Math.random() * (CANNON_BURST_COOLDOWN_MAX - CANNON_BURST_COOLDOWN_MIN),
+        burstLeft: 0, shotTimer: 0, targetId: '',
+        aim: { x: worldPos.x, y: worldPos.y, z: worldPos.z },
+      }, extra || {}));
+    };
+    for (const t of man.turrets) {
+      const tf = {
+        fwd: this._localDirToWorld(pose, ...t.tf.fwd),
+        side: this._localDirToWorld(pose, ...t.tf.side),
+        up: this._localDirToWorld(pose, ...t.tf.up),
+      };
+      const pivot = this._localToWorld(pose, ...t.pivot);
+      const m = t.muzzles[0] || [0, 0, 0];
+      const muzzle = {
+        x: pivot.x + tf.side.x * m[0] + tf.up.x * m[1] + tf.fwd.x * m[2],
+        y: pivot.y + tf.side.y * m[0] + tf.up.y * m[1] + tf.fwd.y * m[2],
+        z: pivot.z + tf.side.z * m[0] + tf.up.z * m[1] + tf.fwd.z * m[2],
+      };
+      const launcher = t.kind === 'missile';
+      add(launcher ? 'launcher' : 'cannon', t.id, t.aim, t.tf.up, launcher ? LAUNCHER_HP : CANNON_HP, {
+        authored: true, pivot, tf, muzzle, muzzleOffsets: t.muzzles, arc: t.arc, pitchMin: t.pitchMin, pitchMax: t.pitchMax,
+        hitR: clamp(t.radius * 1.3, 6, 14), reload: Math.random() * 3,
+      });
+    }
+    for (const gdef of man.shieldgens) {
+      add('shieldgen', gdef.id, gdef.pos, [0, gdef.pos[1] < 0 ? -1 : 1, 0], SHIELDGEN_HP, {
+        authored: true, hitR: clamp(gdef.radius * 1.2, 9, 22),
+      });
+    }
+  }
+  // Authored fire gate: the target must sit inside the turret's traverse limits AND above the
+  // GLB's self-hit-safe minimum pitch for that yaw (the same 72-entry arc the SP Dreadnought uses).
+  _authoredCanHit(s, to) {
+    const v = sub(to, s.pivot);
+    const f = dot(v, s.tf.fwd), sd = dot(v, s.tf.side), u = dot(v, s.tf.up);
+    const elev = Math.atan2(u, Math.hypot(f, sd));
+    if (elev < s.pitchMin || elev > s.pitchMax) return false;
+    if (s.arc) {
+      const yawDeg = Math.atan2(sd, f) * 180 / Math.PI;
+      const i = ((Math.round(yawDeg / 5) % 72) + 72) % 72;
+      if (elev * 180 / Math.PI < s.arc[i]) return false;
+    }
+    return true;
+  }
+
   _buildCapital(team) {
     const pose = this._capitalPose(team);
     this._caps[team] = pose;
+    const man = this._manifests && this._manifests[team];
+    if (man) { this._buildAuthored(team, pose, man); return; }
     const L = pose.len;
     const layout = this._layout();
     layout.forEach((row, idx) => {
@@ -243,92 +375,107 @@ export class CapitalAssault {
 
   // Per-tick: run every cannon's aim + burst-fire logic. Called from room.tick() while CSA is live.
   update(dt) {
-    if (!this.active) return;
-    for (const s of this._emp.values()) {
-      if (s.kind !== 'cannon' || !s.e.alive) continue;
-      this._updateCannon(s, dt);
+    if (!this.active || !(dt > 0)) return;
+    const candidates = [];
+    for (const [sid, ship] of this.room.state.ships) {
+      if (!ship.alive) { this._fireTargets.delete(sid); continue; }
+      let target = this._fireTargets.get(sid);
+      if (!target) { target = { sid, ship, position: {}, velocity: {} }; this._fireTargets.set(sid, target); }
+      target.ship = ship;
+      Object.assign(target.position, { x: ship.px, y: ship.py, z: ship.pz });
+      Object.assign(target.velocity, { x: ship.vx || 0, y: ship.vy || 0, z: ship.vz || 0 });
+      candidates.push(target);
+    }
+    for (const sid of this._fireTargets.keys()) if (!this.room.state.ships.has(sid)) this._fireTargets.delete(sid);
+    for (const team of [0, 1]) {
+      const capital = this._fireGroups[team] ||= { userData: { capitalCombat: { seed: 8100 + team }, turrets: [] } };
+      capital.userData.turrets = [...this._emp.values()].filter(s => s.capTeam === team && s.kind !== 'shieldgen');
+      for (const mount of capital.userData.turrets) {
+        mount.alive = mount.e.alive; mount.e.firing = false;
+        mount.type = mount.kind === 'launcher' ? 'missile' : 'laser';
+        mount.muzzles = mount.muzzleOffsets?.length ? mount.muzzleOffsets : [[0, 0, 2]];
+        mount.nextMuzzle ||= 0;
+        mount.direction ||= { ...(mount.tf?.fwd || mount.normalWorld) };
+      }
+      updateCapitalFireControl(capital, dt, {
+        targets: () => candidates.filter(t => t.ship.team !== team),
+        distance: (mount, target) => len(sub(target.position, mount.worldPos)),
+        canTarget: (mount, target, range) => len(sub(target.position, mount.worldPos)) <= range &&
+          (mount.authored ? this._authoredCanHit(mount, target.position) : dot(norm(sub(target.position, mount.worldPos)), mount.normalWorld) >= CANNON_ARC_DOT),
+        aim: (mount, target, step, control, profile) => this._aimWeapon(mount, target, step, control, profile),
+        clearShot: (_cap, mount, target, profile) => this._weaponClear(mount, target, profile),
+        lockWarning: (mount, target) => this.room.broadcast('aiLock', { target: target.sid, source: 'capital', key: mount.key }),
+        fire: (_cap, mount, target, profile) => {
+          const from = this._weaponMuzzle(mount), direction = mount.direction;
+          let fired;
+          if (mount.type === 'missile') fired = this.room.spawnCapitalMissile(team, from, direction, target.sid,
+            len(sub(target.position, from)), profile.missileDamage);
+          else fired = this._fireCannonShot(mount, target, profile);
+          if (!fired) return false;
+          mount.nextMuzzle++; mount.e.firing = true;
+          this.room.broadcast('capCannonFire', { team, x: from.x, y: from.y, z: from.z, key: mount.key, launcher: mount.type === 'missile' });
+          return true;
+        },
+      });
     }
   }
 
-  // Drive one cannon: acquire the nearest in-range enemy ship WITH a clean shot, slew the aim point
-  // toward it, and fire 3-5 round bursts on a cooldown. `firing` pulses true for one tick per burst
-  // start so clients play the faction cannon sound + flash.
-  _updateCannon(s, dt) {
-    const room = this.room;
-    const enemyTeam = s.capTeam === 0 ? 1 : 0;   // cannons shoot the OTHER faction's pilots
-    // Clear last tick's one-shot fire pulse (the schema field is a per-tick edge).
-    if (s.e.firing) s.e.firing = false;
-
-    // Acquire / validate a target: the nearest LIVE enemy ship within range that we have a clean
-    // (unblocked-by-our-own-hull) shot on. Re-acquire if the current target is gone / out of range /
-    // now occluded, so a cannon doesn't keep tracking a target it can no longer hit.
-    let target = this._pickCannonTarget(s, enemyTeam);
-    if (target) { s.targetId = target.sid; } else { s.targetId = ''; }
-
-    // Slew the replicated aim point toward the target (or hold) so clients can animate the barrels.
-    if (target) {
-      const want = { x: target.ship.px, y: target.ship.py, z: target.ship.pz };
-      // Ease the aim toward the target at CANNON_TURN (approx, frame-rate independent).
-      const k = clamp(CANNON_TURN * dt, 0, 1);
-      s.aim.x += (want.x - s.aim.x) * k;
-      s.aim.y += (want.y - s.aim.y) * k;
-      s.aim.z += (want.z - s.aim.z) * k;
-      s.e.aimX = s.aim.x; s.e.aimY = s.aim.y; s.e.aimZ = s.aim.z;
+  _weaponMuzzle(s) {
+    if (!s.authored) return { x: s.worldPos.x + s.direction.x * 2, y: s.worldPos.y + s.direction.y * 2, z: s.worldPos.z + s.direction.z * 2 };
+    const d = s.direction, tf = s.tf;
+    const yaw = Math.atan2(dot(d, tf.side), dot(d, tf.fwd));
+    const elevation = Math.asin(clamp(dot(d, tf.up), -1, 1));
+    const m = s.muzzles[s.nextMuzzle % s.muzzles.length];
+    const out = {};
+    for (const k of ['x', 'y', 'z']) {
+      const right = tf.side[k] * Math.cos(yaw) - tf.fwd[k] * Math.sin(yaw);
+      const horizontal = tf.side[k] * Math.sin(yaw) + tf.fwd[k] * Math.cos(yaw);
+      const up = tf.up[k] * Math.cos(elevation) - horizontal * Math.sin(elevation);
+      out[k] = s.pivot[k] + right * m[0] + up * m[1] + d[k] * m[2];
     }
-
-    // Burst state machine. Between bursts: count down the cooldown; when it elapses AND we have a
-    // valid target, arm a fresh 3-5 shot burst. During a burst: drop a shot every CANNON_SHOT_GAP.
-    if (s.burstLeft > 0) {
-      s.shotTimer -= dt;
-      if (s.shotTimer <= 0 && target) {
-        this._fireCannonShot(s, target);
-        s.shotTimer = CANNON_SHOT_GAP;
-        s.burstLeft--;
-        if (s.burstLeft <= 0) {
-          s.cooldown = CANNON_BURST_COOLDOWN_MIN + Math.random() * (CANNON_BURST_COOLDOWN_MAX - CANNON_BURST_COOLDOWN_MIN);
-        }
-      } else if (!target) {
-        // Lost the target mid-burst: abort the burst and recover to cooldown.
-        s.burstLeft = 0;
-        s.cooldown = CANNON_BURST_COOLDOWN_MIN * 0.5;
-      }
-    } else {
-      s.cooldown -= dt;
-      if (s.cooldown <= 0 && target) {
-        // Start a burst: fire the FIRST shot now (pulses `firing` so clients cue the sound), and
-        // queue the rest on the shot gap.
-        s.burstLeft = CANNON_BURST_MIN + Math.floor(Math.random() * (CANNON_BURST_MAX - CANNON_BURST_MIN + 1));
-        this._fireCannonShot(s, target, /*burstStart*/ true);
-        s.shotTimer = CANNON_SHOT_GAP;
-        s.burstLeft--;
-        if (s.burstLeft <= 0) {
-          s.cooldown = CANNON_BURST_COOLDOWN_MIN + Math.random() * (CANNON_BURST_COOLDOWN_MAX - CANNON_BURST_COOLDOWN_MIN);
-        }
-      }
-    }
+    return out;
   }
 
-  // Nearest live enemy ship to this cannon within CANNON_RANGE, on the cannon's firing side, with a
-  // CLEAN line of sight (the shot doesn't pass through EITHER capital's solid core). Returns
-  // { sid, ship, dist } or null. Bots count as ships, so they're valid targets too.
-  _pickCannonTarget(s, enemyTeam) {
-    const room = this.room;
-    const from = s.worldPos;
-    let best = null, bestD = CANNON_RANGE;
-    for (const [sid, ship] of room.state.ships) {
-      if (!ship.alive) continue;
-      if (ship.team !== enemyTeam) continue;         // only shoot the attacking faction
-      const to = { x: ship.px, y: ship.py, z: ship.pz };
-      const d = len(sub(to, from));
-      if (d > bestD) continue;
-      // Fire arc: target must be roughly on the side of the hull this cannon faces.
-      const dir = norm(sub(to, from));
-      if (dot(dir, s.normalWorld) < CANNON_ARC_DOT) continue;
-      // Clean-shot gate: the muzzle->target segment must not graze either capital's solid core.
-      if (!this._clearShot(from, to, s.capTeam)) continue;
-      best = { sid, ship, dist: d }; bestD = d;
+  _aimWeapon(s, target, dt, control, p) {
+    const from = this._weaponMuzzle(s), want = {};
+    const blend = 1 - Math.exp(-dt / p.reactionTime);
+    for (const k of ['x', 'y', 'z']) control.velocity[k] += (target.velocity[k] - control.velocity[k]) * blend;
+    if (s.type === 'missile') Object.assign(want, target.position);
+    else {
+      interceptPoint(from, target.position, control.velocity, p.boltSpeed, p.range / p.boltSpeed, want);
+      const error = len(sub(target.position, from)) * p.aimError;
+      for (const k of ['x', 'y', 'z']) want[k] += control.error[k] * error;
     }
-    return best;
+    const desired = norm(sub(want, from)), current = s.direction;
+    const angle = Math.acos(clamp(dot(current, desired), -1, 1));
+    const maxStep = (s.type === 'missile' ? p.missileTurnRate : p.turnRate) * dt;
+    if (angle <= maxStep) s.direction = desired;
+    else {
+      // A bounded angular step, including a stable axis for the antiparallel case.
+      let tangent = sub(desired, { x: current.x * Math.cos(angle), y: current.y * Math.cos(angle), z: current.z * Math.cos(angle) });
+      if (len(tangent) < 1e-7) tangent = Math.abs(current.y) < 0.9 ? { x: -current.z, y: 0, z: current.x } : { x: 1, y: 0, z: 0 };
+      tangent = norm(tangent);
+      s.direction = norm({ x: current.x * Math.cos(maxStep) + tangent.x * Math.sin(maxStep),
+        y: current.y * Math.cos(maxStep) + tangent.y * Math.sin(maxStep), z: current.z * Math.cos(maxStep) + tangent.z * Math.sin(maxStep) });
+    }
+    const distance = Math.max(20, len(sub(want, s.worldPos)));
+    s.e.aimX = s.worldPos.x + s.direction.x * distance;
+    s.e.aimY = s.worldPos.y + s.direction.y * distance;
+    s.e.aimZ = s.worldPos.z + s.direction.z * distance;
+    const arcOK = s.authored ? this._authoredCanHit(s, { x: s.pivot.x + s.direction.x * distance,
+      y: s.pivot.y + s.direction.y * distance, z: s.pivot.z + s.direction.z * distance }) : dot(s.direction, s.normalWorld) >= CANNON_ARC_DOT;
+    return arcOK && dot(s.direction, desired) >= (s.type === 'missile' ? p.lockCone : Math.cos(p.aimTolerance));
+  }
+
+  _weaponClear(s, target, p) {
+    const from = this._weaponMuzzle(s), d = Math.min(p.range, len(sub(target.position, from)));
+    const end = s.type === 'missile' ? target.position : { x: from.x + s.direction.x * d, y: from.y + s.direction.y * d, z: from.z + s.direction.z * d };
+    if (!this._clearShot(from, end, s.capTeam, !!s.authored)) return false;
+    for (const [sid, ship] of this.room.state.ships) {
+      if (!ship.alive || ship.team !== s.capTeam) continue;
+      if (segmentSphereTime(from, end, { x: ship.px, y: ship.py, z: ship.pz }, 4) !== null) return false;
+    }
+    return true;
   }
 
   // True if the segment from->to has an OPEN path (doesn't pass through a capital's solid core). A
@@ -336,8 +483,9 @@ export class CapitalAssault {
   // We test both capitals' solid cores; the firing cannon's OWN capital is the usual blocker (target
   // on the far side of the hull), and we also refuse a shot that would tunnel through the enemy hull
   // to reach a pilot hugging its far side. A small start offset skips the muzzle's own hull skin.
-  _clearShot(from, to, firingTeam) {
+  _clearShot(from, to, firingTeam, enemyOnly = false, targetStructureTeam = -1) {
     for (const team of [0, 1]) {
+      if ((enemyOnly && team === firingTeam) || team === targetStructureTeam) continue;
       const c = this.room.baseCenter(team);
       // For the FIRING cannon's OWN capital, block only against the tight SOLID CORE — the actual
       // impassable body. Using the loose outer collide radius here falsely blocked every shot at a
@@ -360,130 +508,68 @@ export class CapitalAssault {
     return true;
   }
 
-  // Spawn ONE capital cannon bolt from a cannon toward its target, with imperfect aim. Bolts are
+  // Conservative solid-core cover for already airborne capital shots.
+  coverTime(from, to, firingTeam) {
+    let first = Infinity;
+    for (const team of [0, 1]) {
+      const center = this.room.baseCenter(team), radius = this.room.baseSolidCore?.(team) || 62;
+      // Authored launchers may sit inside the conservative core envelope; their firing arc
+      // already rejects shots into their own hull. Let that projectile leave the muzzle.
+      if (team === firingTeam && Math.hypot(from.x - center.x, from.y - center.y, from.z - center.z) < radius) continue;
+      const time = segmentSphereTime(from, to, center, radius);
+      if (time !== null) first = Math.min(first, time);
+    }
+    return first === Infinity ? null : first;
+  }
+
+  // Spawn one physical bolt along the actual barrel direction. Bolts are
   // tagged `capital` (bright/large client render), given a long TTL + high speed so they streak far
   // off the battlefield, and are team-tagged so the existing advanceBolts hit logic damages the
   // ATTACKING faction's ships (no friendly fire). `burstStart` pulses the replicated fire event so
   // clients play the faction cannon sound + muzzle flash exactly once per burst.
-  _fireCannonShot(s, target, burstStart = false) {
-    const room = this.room;
-    if (room.state.bolts.size >= 400) return;   // respect the room's global bolt cap
-    const from = s.worldPos;
-    const to = { x: target.ship.px, y: target.ship.py, z: target.ship.pz };
-    // Lead the target slightly by its velocity so a moving pilot is actually threatened.
-    const lead = 0.18;
-    const aim = {
-      x: to.x + (target.ship.vx || 0) * lead,
-      y: to.y + (target.ship.vy || 0) * lead,
-      z: to.z + (target.ship.vz || 0) * lead,
-    };
-    let dir = norm(sub(aim, from));
-    // Imperfect aim: scatter within a cone so the capital only occasionally connects.
-    dir = norm({
-      x: dir.x + (Math.random() - 0.5) * CANNON_SPREAD,
-      y: dir.y + (Math.random() - 0.5) * CANNON_SPREAD,
-      z: dir.z + (Math.random() - 0.5) * CANNON_SPREAD,
-    });
-    const bolt = new Bolt();
-    bolt.owner = 'cap:' + s.capTeam;   // non-ship owner id (never matches a sessionId, so no self-hit)
-    bolt.team = s.capTeam;             // defending team -> advanceBolts spares this team, hits the enemy
-    bolt.capital = true;
-    // Spawn a bit ahead of the muzzle so it clears the hull skin.
-    bolt.px = from.x + dir.x * 6;
-    bolt.py = from.y + dir.y * 6;
-    bolt.pz = from.z + dir.z * 6;
-    bolt.vx = dir.x * CANNON_BOLT_SPEED;
-    bolt.vy = dir.y * CANNON_BOLT_SPEED;
-    bolt.vz = dir.z * CANNON_BOLT_SPEED;
-    bolt._ttl = CANNON_BOLT_TTL;
-    const id = 'cb' + (++this._boltSeq);
-    room.state.bolts.set(id, bolt);
-    // Cue the client on the FIRST shot of a burst: faction sound + a big muzzle flash at the cannon.
-    if (burstStart) {
-      s.e.firing = true;
-      room.broadcast('capCannonFire', {
-        team: s.capTeam, x: from.x, y: from.y, z: from.z, key: s.key,
-      });
-    }
+  _fireCannonShot(s, target, profile) {
+    if (this.room.state.bolts.size >= 400) return false;
+    const from = this._weaponMuzzle(s), dir = s.direction, bolt = new Bolt();
+    bolt.owner = 'cap:' + s.capTeam; bolt.team = s.capTeam; bolt.capital = true;
+    bolt.px = from.x + dir.x * 1.5; bolt.py = from.y + dir.y * 1.5; bolt.pz = from.z + dir.z * 1.5;
+    bolt.vx = dir.x * profile.boltSpeed; bolt.vy = dir.y * profile.boltSpeed; bolt.vz = dir.z * profile.boltSpeed;
+    bolt._ttl = profile.range / profile.boltSpeed + 0.15;
+    bolt._damage = profile.boltDamage;
+    this.room.state.bolts.set('cb' + (++this._boltSeq), bolt);
+    return true;
   }
 
-  // Test a player/bot bolt (from advanceBolts) against the ENEMY capital's emplacements and, once its
-  // shield gens are down, its HULL. Returns true if the bolt struck something (so the caller consumes
-  // it). A bolt only ever affects the capital of the team OPPOSITE the shooter.
   testBoltHit(bolt, nx, ny, nz) {
-    const targetTeam = bolt.team === 0 ? 1 : 0;   // shooters attack the ENEMY capital
-    // 1) Emplacements first: a hit on a live cannon/generator damages IT (bright, specific feedback).
-    let hitKey = null, hitDist2 = Infinity;
-    for (const s of this._emp.values()) {
-      if (s.capTeam !== targetTeam || !s.e.alive) continue;
-      const r = s.kind === 'shieldgen' ? 9 : 7;   // world hit radius (generators read a touch bigger)
-      const d2 = segPointDist2(bolt.px, bolt.py, bolt.pz, nx, ny, nz, s.worldPos.x, s.worldPos.y, s.worldPos.z);
-      if (d2 < r * r && d2 < hitDist2) { hitDist2 = d2; hitKey = s.key; }
-    }
-    if (hitKey) { this._damageEmplacement(hitKey, this._boltDamage(bolt)); return true; }
-
-    // 2) HULL: only takes real damage once ALL of this capital's shield gens are down. While shielded,
-    // a bolt that reaches the hull is DEFLECTED (consumed, no damage) so it visibly stops at the ship
-    // rather than passing through. We test against the capital's solid core sphere.
-    const c = this.room.baseCenter(targetTeam);
-    const coreR = this.room.baseCollideRadius ? this.room.baseCollideRadius(targetTeam) : 90;
-    const d2 = segPointDist2(bolt.px, bolt.py, bolt.pz, nx, ny, nz, c.x, c.y, c.z);
-    if (d2 < coreR * coreR) {
-      const gens = this.liveGens(targetTeam);
-      if (gens > 0) {
-        // Shielded: deflect (consume the bolt, no hull damage). Tell clients to bloom the shield.
-        this.room.broadcast('capShieldDeflect', { team: targetTeam, x: bolt.px, y: bolt.py, z: bolt.pz });
-      } else {
-        this._damageCapitalHull(targetTeam, this._boltDamage(bolt) * 0.5, bolt.px, bolt.py, bolt.pz);
-      }
-      return true;
-    }
-    return false;
+    return this.testStructureHit(bolt, bolt.px, bolt.py, bolt.pz, nx, ny, nz, false);
   }
 
-  // Test a player/bot MISSILE (from the missile fuse loop) against the ENEMY capital's emplacements
-  // and, once its shield gens are down, its HULL. Returns true if the missile detonated on the capital
-  // (so the caller consumes it and plays a warhead blast). Mirrors testBoltHit but with a warhead's
-  // larger proximity radius and heavier damage — a missile is a decisive anti-structure weapon, so a
-  // hit on a generator does real work and a hull hit (shields down) bites hard. `mx,my,mz` is the
-  // missile's previous position and `nx,ny,nz` its advanced position (the swept segment this tick), so
-  // a fast dart can't tunnel past a small emplacement between ticks.
-  testMissileHit(m, mx, my, mz, nx, ny, nz) {
-    const targetTeam = m.team === 0 ? 1 : 0;   // shooters attack the ENEMY capital
-    const dmg = this._missileDamage();
-    // 1) Emplacements first: a warhead within the (generous) blast radius of a live cannon/generator
-    //    guts it. The radius is wider than a bolt's since a missile detonates with a proximity fuse.
-    let hitKey = null, hitDist2 = Infinity, hitPos = null;
-    for (const s of this._emp.values()) {
-      if (s.capTeam !== targetTeam || !s.e.alive) continue;
-      const r = s.kind === 'shieldgen' ? 22 : 20;   // warhead proximity radius (bigger than a bolt's)
-      const d2 = segPointDist2(mx, my, mz, nx, ny, nz, s.worldPos.x, s.worldPos.y, s.worldPos.z);
-      if (d2 < r * r && d2 < hitDist2) { hitDist2 = d2; hitKey = s.key; hitPos = s.worldPos; }
-    }
-    if (hitKey) {
-      this._damageEmplacement(hitKey, dmg);
-      this.room.broadcast('missileHit', { x: hitPos.x, y: hitPos.y, z: hitPos.z, owner: m.owner, victim: '' });
-      return true;
-    }
+  testMissileHit(missile, x, y, z, nx, ny, nz) {
+    return this.testStructureHit(missile, x, y, z, nx, ny, nz, true);
+  }
 
-    // 2) HULL: only takes real damage once ALL shield gens are down. While shielded, a warhead that
-    //    reaches the hull is DEFLECTED (consumed, no damage) exactly like a bolt so it visibly stops
-    //    at the dome. Tested against the capital's solid core sphere with a small warhead standoff so
-    //    a proximity detonation just outside the hull still counts.
-    const c = this.room.baseCenter(targetTeam);
-    const coreR = (this.room.baseCollideRadius ? this.room.baseCollideRadius(targetTeam) : 90) + 6;
-    const d2 = segPointDist2(mx, my, mz, nx, ny, nz, c.x, c.y, c.z);
-    if (d2 < coreR * coreR) {
-      const gens = this.liveGens(targetTeam);
-      if (gens > 0) {
-        this.room.broadcast('capShieldDeflect', { team: targetTeam, x: nx, y: ny, z: nz });
-      } else {
-        this._damageCapitalHull(targetTeam, dmg * 0.5, nx, ny, nz);
-      }
-      this.room.broadcast('missileHit', { x: nx, y: ny, z: nz, owner: m.owner, victim: '' });
-      return true;
+  testStructureHit(projectile, x, y, z, nx, ny, nz, missile) {
+    if (!this.active || this.room.state.matchState !== 'live') return false;
+    const team = 1 - projectile.team;
+    const dx = nx - x, dy = ny - y, dz = nz - z;
+    const from = { x, y, z }, to = { x: nx, y: ny, z: nz };
+    let first = hullEntry(this._caps[team], from, to) ?? Infinity;
+    let mount = null;
+    for (const emplacement of this._emp.values()) {
+      if (emplacement.capTeam !== team || !emplacement.e.alive) continue;
+      const n = emplacement.normalWorld;
+      if (dx*n.x + dy*n.y + dz*n.z > 0) continue;
+      const radius = emplacement.hitR || (emplacement.kind === 'shieldgen' ? 9 : 7);
+      const t = segmentSphereTime(from, to, emplacement.worldPos, radius + (missile ? 13 : 0));
+      if (t !== null && t < first) { first = t; mount = emplacement; }
     }
-    return false;
+    if (!Number.isFinite(first)) return false;
+    const hit = { x: x+first*dx, y: y+first*dy, z: z+first*dz };
+    const damage = missile ? this._missileDamage() : this._boltDamage(projectile);
+    if (mount) this._damageEmplacement(mount.key, damage);
+    else if (this.liveGens(team)) this.room.broadcast('capShieldDeflect', { team, ...hit });
+    else this._damageCapitalHull(team, damage * 0.5, hit.x, hit.y, hit.z);
+    if (missile) this.room.broadcast('missileHit', { ...hit, owner: projectile.owner, victim: '' });
+    return true;
   }
 
   // A missile's damage to capital structures — a fixed heavy warhead value (missiles don't scale with
@@ -521,6 +607,7 @@ export class CapitalAssault {
   // Apply damage to a team's capital HULL (only reachable once its shields are down). Writes the
   // replicated integrity and, at 0, ends the match with the OTHER team as the winner.
   _damageCapitalHull(team, dmg, x, y, z) {
+    if (this.liveGens(team) > 0 || !(dmg > 0)) return;
     const key = team === 0 ? 'blueCapHull' : 'redCapHull';
     const cur = this.room.state[key];
     const next = Math.max(0, cur - dmg);

@@ -81,7 +81,9 @@ const httpServer = createServer((req, res) => {
   }
   const path = (req.url || '').split('?')[0];
   if (req.method === 'GET' && (path === '/health' || path === '/' || path === '/healthz')) {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    const revision = process.env.RAILWAY_GIT_COMMIT_SHA;
+    if (revision && /^[0-9a-f]{40}$/i.test(revision)) res.setHeader('X-CSM-Revision', revision);
+    res.writeHead(200, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
     res.end('Call Sign Mamba arena server OK');
     return;
   }
@@ -116,6 +118,9 @@ const httpServer = createServer((req, res) => {
 const gameServer = new Server({
   transport: new WebSocketTransport({
     server: httpServer,
+    // A brief network or browser stall should not discard a running match.
+    pingInterval: 5000,
+    pingMaxRetries: 6,
   }),
 });
 

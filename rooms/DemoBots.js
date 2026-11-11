@@ -1,4 +1,4 @@
-// ---- DemoBots: DEMO-ONLY AI squadron filler (REMOVE BEFORE SHIP) -----------------------------
+// ---- Server-owned multiplayer pilots; objective logic plus shared campaign skill rules. ------
 // This module exists purely to stage a lively, believable Capture the Cargo match for recording a
 // demo video WITHOUT needing 9 human pilots. When enabled, the human host starting a CTC lobby is
 // joined by 4 friendly bots (their squadron) and 5 enemy bots (the opposing squadron). Bots:
@@ -19,6 +19,9 @@
 import { Ship } from './schema.js';
 import { stepShip, forwardFromQuat, yawQuatToward, FLIGHT } from '../shared/flightModel.js';
 import { statsFor } from './shipStats.js';
+import { SKILL_TABLE, MAX_TOF, EVADE_TABLE } from '../shared/pilotTuning.js';
+import { BOLT_SPEED, BOLT_LIFETIME, MISSILE_LOCK_RANGE, MISSILE_LOCK_TIME } from '../shared/combatHardware.js';
+import { interceptPoint, segmentSphereTime } from '../shared/capitalFireControl.js';
 
 // Max yaw/pitch rate (rad/s) at full deflection — the number the turn-radius governor divides speed
 // by to know how tightly a bot can corner at its current velocity. Sourced from the shared model so
@@ -132,7 +135,6 @@ export class DemoBots {
       vel: { x: 0, y: 0, z: 0 },
       quat: { x: ship.qx, y: ship.qy, z: ship.qz, w: ship.qw },
       inputs: [], lastSeq: 0,
-      lastSeen: room._now,   // refreshed each tick in update() so the ghost-reaper never evicts a bot
       fireCd: 0, missileCd: 0, lastHitAt: -999, respawnAt: 0, killStreak: 0,
       history: [], rtt: 0, _probe: null, _nextProbeAt: 0,
       maxHull, maxShields, maxMissiles: ship.maxMissiles,
@@ -143,7 +145,7 @@ export class DemoBots {
 
     // Per-bot AI scratch (server-only).
     this._bots.set(sid, {
-      team: spec.team,
+      team: spec.team, rank: spec.rank || 'Officer',
       role: 'contest',       // cargo-centric role this bot is currently playing (see _assignRole)
       targetId: null,        // the ship this role wants to engage/escort ('' = none, fly the objective)
       retargetAt: 0,
@@ -195,12 +197,13 @@ export class DemoBots {
       const s = room.sim.get(sid);
       const ship = room.state.ships.get(sid);
       if (!s || !ship) { this._bots.delete(sid); continue; }
-      s.lastSeen = room._now;   // keep the ghost-reaper off the bots
       if (!live || !ship.alive) {
         // Hold station (idle input) while dead/in lobby; the integrator will bleed velocity to rest.
+        ai.attackTarget = ''; ai.lockTarget = ''; ai.lockT = 0; ai.perceived = null; ai.evadeUntil = 0;
         s.lastInput = { seq: 0, steerX: 0, steerY: 0, roll: 0, thrust: false, reverse: false, boost: false };
         continue;
       }
+      ai.skill ||= SKILL_TABLE[ai.rank || 'Officer'];
       this._think(sid, ai, s, ship, dt);
     }
   }
@@ -211,17 +214,17 @@ export class DemoBots {
     // Occasionally re-evaluate our cargo-centric ROLE + engagement target so behavior isn't perfectly
     // steady (and so the squad re-forms around the flag as it changes hands).
     if (room._now >= ai.retargetAt) {
-      ai.retargetAt = room._now + BOT_RETARGET_SEC * (0.7 + Math.random() * 0.6);
+      ai.retargetAt = room._now + Math.max(0.25, ai.skill.reactionDelay);
       this._assignRole(sid, ai, s, ship);
     }
     // Refresh aim jitter a few times a second so steering has human-like imperfection.
     if (room._now >= ai.jitterAt) {
-      ai.jitterAt = room._now + 0.18;
-      ai.jitterX = (Math.random() * 2 - 1) * BOT_REACT_JITTER;
-      ai.jitterY = (Math.random() * 2 - 1) * BOT_REACT_JITTER;
+      ai.jitterAt = room._now + ai.skill.reactionDelay;
+      ai.jitterX = (Math.random() * 2 - 1) * ai.skill.aimError;
+      ai.jitterY = (Math.random() * 2 - 1) * ai.skill.aimError;
     }
     // Resolve a world-space GOAL point to fly toward + whether it's a ship to shoot.
-    const goal = this._goalPoint(sid, ai, s, ship);
+    const goal = this._combatGoal(sid, ai, s, ship, this._goalPoint(sid, ai, s, ship), dt);
     const input = this._steerToward(s, goal.x, goal.y, goal.z, ai);
     const aligned = input._fdot;   // 1 = goal dead ahead, <0 = behind us (overshot)
 
@@ -286,38 +289,106 @@ export class DemoBots {
     // rack paces the same whether it's throwing warheads at a pilot or at the enemy capital.
     if (ai.botMissileCd > 0) ai.botMissileCd -= dt;
 
-    // Fire control: bolts when a hostile is close and roughly ahead; the odd missile at mid range.
-    if (goal.shoot && goal.targetShip) {
-      const fwd = forwardFromQuat(s.quat);
-      const dx = goal.targetShip.px - s.pos.x, dy = goal.targetShip.py - s.pos.y, dz = goal.targetShip.pz - s.pos.z;
-      const range = Math.hypot(dx, dy, dz) || 1;
-      const dot = (fwd.x * dx + fwd.y * dy + fwd.z * dz) / range;
-      if (range < BOT_FIRE_RANGE && dot > BOT_FIRE_CONE && Math.random() < BOT_FIRE_CHANCE) {
-        room.tryFire(sid);
-      }
-      // ---- CSA ANTI-STRUCTURE MISSILES ---------------------------------------------------------
-      // On a capital attack run the goal's "targetShip" is a pseudo target standing in for the enemy
-      // capital's current aim point (a shield generator, or the exposed hull once the gens are down).
-      // A missile there is a DUMBFIRE (no ship lock) that the server's testMissileHit path detonates
-      // on the capital — so assault bots contribute real warhead damage to knocking the capital out,
-      // not just bolts. It's a big, fat, stationary target, so we fire more freely (wider cone, longer
-      // range, higher chance) than at a jinking pilot, on the bot's own missile cooldown + ammo rack.
-      if (ai.role === 'csaAssault') {
-        if (ai.botMissileCd <= 0 && (ship.missiles | 0) > 0 &&
-            range < BOT_CSA_MISSILE_RANGE && dot > BOT_CSA_MISSILE_CONE &&
-            Math.random() < BOT_CSA_MISSILE_CHANCE) {
-          room.tryFireMissile(sid, '');   // dumbfire at the capital (no ship to lock)
-          ai.botMissileCd = BOT_CSA_MISSILE_COOLDOWN;
-        }
-      } else if (ai.botMissileCd <= 0 && range < BOT_MISSILE_RANGE && dot > 0.9 && Math.random() < BOT_MISSILE_CHANCE) {
-        // Anti-SHIP missile (all other modes / the csaDog role): needs a real lock on a pilot.
-        room.tryFireMissile(sid, goal.targetId);
-        ai.botMissileCd = BOT_MISSILE_COOLDOWN;
-      }
+    this._weapons(sid, ai, s, ship, goal, dt);
+    if ((s.heat?.v || 0) >= ai.skill.boostDiscipline) input.boost = false;
+    // A committed gun run does not park in space. Precision cargo pickups remain exempt.
+    if (goal.shoot && !goal.precision && speed < FLIGHT.BASE_TOP * (s.speed || 1) * 0.6) {
+      input.thrust = true; input.reverse = false;
     }
 
     s.inputs.length = 0;         // bots don't queue; a single fresh intent per tick
     s.lastInput = input;
+  }
+
+  _canReserve(sid, targetId) {
+    let count = 0;
+    for (const [other, pilot] of this._bots) {
+      if (other !== sid && pilot.attackTarget === targetId && this.room.state.ships.get(other)?.alive) count++;
+    }
+    return count < 2;
+  }
+
+  _combatGoal(sid, ai, s, ship, goal, dt) {
+    const now = this.room._now, rank = ai.rank || 'Officer', evade = EVADE_TABLE[rank];
+    // Only a real hit or inbound missile starts an evade. Merely being aimed at does not.
+    const health = ship.hull + ship.shields;
+    const lost = ai.health !== undefined ? Math.max(0, ai.health - health) : 0;
+    ai.health = health;
+    const inbound = [...this.room.state.missiles.values()].find(m => m.target === sid && (this.room.isFFA?.() || m.team !== ship.team));
+    if (inbound || (lost > 0 && now >= (ai.evadeCd || 0) && Math.random() < evade.hitChance + lost / Math.max(1, s.maxHull) * evade.dmgGain)) {
+      if (!ai.evadeUntil || now >= ai.evadeUntil) {
+        ai.evadeUntil = now + evade.time; ai.evadeCd = now + evade.time + evade.cooldown;
+        ai.evadeSide = Math.random() < 0.5 ? -1 : 1;
+      }
+    }
+    if (now < (ai.evadeUntil || 0)) {
+      const f = forwardFromQuat(s.quat), side = quatRight(s.quat);
+      ai.attackTarget = ''; ai.lockT = Math.max(0, (ai.lockT || 0) - dt * 1.6);
+      return { x: s.pos.x + f.x * 120 + side.x * ai.evadeSide * 150,
+        y: s.pos.y + f.y * 120 + side.y * ai.evadeSide * 150,
+        z: s.pos.z + f.z * 120 + side.z * ai.evadeSide * 150,
+        dist: 190, shoot: false, targetShip: null, targetId: '' };
+    }
+    if (!goal.shoot || !goal.targetShip) { ai.attackTarget = ''; return goal; }
+    const targetId = goal.targetId || (ai.role === 'csaAssault' ? 'structure:' + (1 - ship.team) : '');
+    if (goal.targetId && !this._canReserve(sid, goal.targetId)) {
+      ai.attackTarget = '';
+      return { ...goal, shoot: false }; // hold the objective while the current attackers commit
+    }
+    ai.attackTarget = goal.targetId || '';
+    if (ai.aimTarget !== targetId) {
+      ai.aimTarget = targetId; ai.perceived = { x: 0, y: 0, z: 0 };
+      ai.acquireAt = now + ai.skill.reactionDelay; ai.lockT = 0; ai.lockTarget = ''; ai.lockWarned = false;
+    }
+    const target = goal.targetShip, blend = 1 - Math.exp(-dt / ai.skill.reactionDelay);
+    for (const [k, v] of [['x', 'vx'], ['y', 'vy'], ['z', 'vz']]) ai.perceived[k] += ((target[v] || 0) - ai.perceived[k]) * blend;
+    // MP projectiles inherit shooter velocity; predict relative motion with that same hardware.
+    const relative = { x: ai.perceived.x - s.vel.x, y: ai.perceived.y - s.vel.y, z: ai.perceived.z - s.vel.z };
+    const aim = interceptPoint(s.pos, { x: target.px, y: target.py, z: target.pz }, relative, BOLT_SPEED, BOLT_LIFETIME, {});
+    const range = this._dist(s.pos, { x: target.px, y: target.py, z: target.pz });
+    aim.x += ai.jitterX * range; aim.y += ai.jitterY * range;
+    ai.gunAim = aim;
+    // Preserve navigation during objective pickups/escorts; direct attack runs steer toward the lead.
+    if (goal.chase || ai.role === 'csaDog' || ai.role === 'dogfight') return { ...goal, ...aim };
+    return goal;
+  }
+
+  _weapons(sid, ai, s, ship, goal, dt) {
+    if (!goal.shoot || !goal.targetShip || this.room._now < (ai.acquireAt || 0)) {
+      ai.lockT = Math.max(0, (ai.lockT || 0) - dt * 1.6); return;
+    }
+    const target = goal.targetShip, point = { x: target.px, y: target.py, z: target.pz };
+    const range = this._dist(s.pos, point), fwd = forwardFromQuat(s.quat);
+    const aim = ai.gunAim || point, delta = { x: aim.x - s.pos.x, y: aim.y - s.pos.y, z: aim.z - s.pos.z };
+    const length = Math.hypot(delta.x, delta.y, delta.z) || 1;
+    const alignment = (delta.x * fwd.x + delta.y * fwd.y + delta.z * fwd.z) / length;
+    const clear = this._friendlyClear(sid, ship.team, s.pos, point, !goal.targetId && ai.role === 'csaAssault');
+    if (clear && range / BOLT_SPEED < (goal.targetId ? MAX_TOF[ai.rank || 'Officer'] : BOLT_LIFETIME * 0.92) &&
+        alignment >= Math.cos(ai.skill.fireCone)) this.room.tryFire(sid);
+    // Four continuous seconds of valid tracking; changes of target reset all progress.
+    const id = goal.targetId || (ai.role === 'csaAssault' ? ai.aimTarget : '');
+    if (id !== ai.lockTarget) { ai.lockTarget = id; ai.lockT = 0; ai.lockWarned = false; }
+    const noseDot = ((point.x - s.pos.x) * fwd.x + (point.y - s.pos.y) * fwd.y + (point.z - s.pos.z) * fwd.z) / Math.max(1, range);
+    const tracking = id && clear && range <= MISSILE_LOCK_RANGE && noseDot >= Math.cos(0.25);
+    ai.lockT = tracking ? Math.min(MISSILE_LOCK_TIME, (ai.lockT || 0) + dt) : Math.max(0, (ai.lockT || 0) - dt * 1.6);
+    if (ai.lockT < 0.4) ai.lockWarned = false;
+    if (tracking && ai.lockT >= 1 && !ai.lockWarned && ai.botMissileCd <= 3 && ship.missiles > 0) {
+      ai.lockWarned = true;
+      if (goal.targetId) this.room.broadcast('aiLock', { target: goal.targetId, source: ship.name });
+    }
+    if (tracking && ai.lockT >= MISSILE_LOCK_TIME && ai.botMissileCd <= 0 && ship.missiles > 0) {
+      if (Math.random() < ai.skill.warheadChance) this.room.tryFireMissile(sid, goal.targetId || '');
+      ai.botMissileCd = 5 + Math.random() * 4; ai.lockT = 0; ai.lockWarned = false;
+    }
+  }
+
+  _friendlyClear(sid, team, from, to, aimingAtStructure = false) {
+    if (this.room.isCSA?.() && !this.room.capitalAssault._clearShot(from, to, team, false, aimingAtStructure ? 1 - team : -1)) return false;
+    for (const [id, ship] of this.room.state.ships) {
+      if (id === sid || !ship.alive || this.room.isFFA?.() || ship.team !== team) continue;
+      if (segmentSphereTime(from, to, { x: ship.px, y: ship.py, z: ship.pz }, 4) !== null) return false;
+    }
+    return true;
   }
 
   // CARGO-CENTRIC role assignment — this is what makes every bot look like it understands the
@@ -443,7 +514,7 @@ export class DemoBots {
     }
     // Loose or at home: go grab it (committed run), still shooting anything close on the way.
     ai.role = 'grab';
-    ai.targetId = this._nearestHostile(s, team) || '';
+    ai.targetId = this._nearestHostile(s, team, sid) || '';
     ai.forceDisk = disk;   // _goalPoint reads this so the grab flies at THIS disk, not the team default
   }
 
@@ -460,7 +531,7 @@ export class DemoBots {
     if (room.isCSA && room.isCSA() && room.capitalAssault) {
       const tgt = room.capitalAssault.botCapitalTarget(team, s.pos);
       // A near enemy pilot we can swat on the way in (kept snappy so bots feel alive around you).
-      const nearId = this._nearestHostile(s, team);
+      const nearId = this._nearestHostile(s, team, sid);
       const near = nearId && room.state.ships.get(nearId);
       const nearD = near ? this._dist(s.pos, { x: near.px, y: near.py, z: near.pz }) : Infinity;
       // Dogfighter bias: ~1/3 of the squad prioritizes hunting enemy pilots (screen/aggression) while
@@ -484,6 +555,9 @@ export class DemoBots {
       return;
     }
 
+    if (!room.isCTC?.() && !room.isCDD?.()) {
+      ai.role = 'dogfight'; ai.targetId = this._nearestHostile(s, team, sid); return;
+    }
     const flag = this._objectiveFlag(team, ai);
 
     // I'm the carrier: my role is fixed (run it home) — handled in _goalPoint, but note it here.
@@ -533,13 +607,13 @@ export class DemoBots {
       const nearPod = this._dist(s.pos, fp) < 170;
       ai.role = (nearPod || this._amClosestFew(sid, team, fp, 6)) ? 'grab' : 'contest';   // most of the team commits to the grab run
       // While contesting, a bot still shoots any enemy that strays close to it near the pod.
-      ai.targetId = this._nearestHostile(s, team) || '';
+      ai.targetId = this._nearestHostile(s, team, sid) || '';
       return;
     }
 
     // No flag object at all (shouldn't happen in a live CTC match) -> just fly the center and fight.
     ai.role = 'contest';
-    ai.targetId = this._nearestHostile(s, team) || '';
+    ai.targetId = this._nearestHostile(s, team, sid) || '';
   }
 
   // Resolve the concrete world GOAL point to fly at this tick from the assigned role, plus whether we
@@ -548,6 +622,14 @@ export class DemoBots {
   _goalPoint(sid, ai, s, ship) {
     const room = this.room;
     const team = ship.team;
+    if (ai.role === 'dogfight') {
+      const target = ai.targetId && room.state.ships.get(ai.targetId);
+      if (target?.alive) {
+        const d = this._dist(s.pos, { x: target.px, y: target.py, z: target.pz });
+        return { ...this._pursuitPoint(s, target, d), dist: d, shoot: true, targetShip: target, targetId: ai.targetId, chase: true };
+      }
+    }
+
 
     // ---- CSA GOALS -----------------------------------------------------------------------------
     // csaDog: pure dogfight — settle onto a nearby enemy pilot's six (reuses the pursuit-curve logic
@@ -842,22 +924,23 @@ export class DemoBots {
   // --- small helpers -------------------------------------------------------------------------
   _dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z); }
 
-  _nearestHostile(s, team) {
+  _nearestHostile(s, team, selfId = '') {
     const room = this.room;
     let best = '', bestD = Infinity;
     for (const [id, sh] of room.state.ships) {
-      if (!sh.alive || sh.team === team) continue;
+      if (!sh.alive || id === selfId || (!room.isFFA?.() && sh.team === team)) continue;
       const d = this._dist(s.pos, { x: sh.px, y: sh.py, z: sh.pz });
-      if (d < bestD) { bestD = d; best = id; }
+      if (d < bestD && this._canReserve(selfId, id)) { bestD = d; best = id; }
     }
     return best;
   }
 
   _nearestHostileTo(shipObj, team) {
+    const selfId = [...this.room.state.ships].find(([, ship]) => ship === shipObj)?.[0] || '';
     const room = this.room;
     let best = '', bestD = Infinity;
     for (const [id, sh] of room.state.ships) {
-      if (!sh.alive || sh.team === team) continue;
+      if (!sh.alive || id === selfId || (!room.isFFA?.() && sh.team === team)) continue;
       const d = this._dist({ x: shipObj.px, y: shipObj.py, z: shipObj.pz }, { x: sh.px, y: sh.py, z: sh.pz });
       if (d < bestD) { bestD = d; best = id; }
     }

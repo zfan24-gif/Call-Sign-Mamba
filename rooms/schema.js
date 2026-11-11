@@ -69,6 +69,7 @@ export class Ship extends Schema {
     // --- Out of Bounds ---
     // If > 0, the pilot is outside the arena boundaries and has this many seconds to return before
     // their ship is destroyed by the arena perimeter defenses. 0 means in-bounds.
+    this.connected = true;
     this.oobTimer = 0;
   }
 }
@@ -99,6 +100,7 @@ defineTypes(Ship, {
   ready: 'boolean',
   carrying: 'boolean',
   oobTimer: 'float32',
+  connected: 'boolean',
 });
 
 // ---- Capture the Cargo: the SINGLE neutral cargo pod (the "flag") ------------------------------
@@ -162,9 +164,15 @@ export class Emplacement extends Schema {
     // is a one-tick pulse the server sets when a burst begins so clients react (sound + flash).
     this.firing = false;
     this.aimX = 0; this.aimY = 0; this.aimZ = 0;
+    // Authored GLB part id (e.g. 'LC_3', 'LASER_02', 'SG_1_Port', 'SHIELD_01'). Non-empty when the
+    // layout came from the hull's baked hardpoint manifest: clients drive THAT model part (aim +
+    // damage states) instead of spawning a separate cannon/generator model. kind may then also be
+    // 'launcher' (authored missile turret).
+    this.part = '';
   }
 }
 defineTypes(Emplacement, {
+  part: 'string',
   capTeam: 'uint8',
   kind: 'string',
   lx: 'float32', ly: 'float32', lz: 'float32',
@@ -258,6 +266,7 @@ export class ArenaState extends Schema {
     // --- Free-For-All result (only meaningful when mode === 'ffa') ---
     // FFA has no teams: the winner is the single pilot with the most kills when the clock hits 0.
     // These are set when an FFA match ends so every client can show the winning pilot banner.
+    this.demoBotsEnabled = false;
     this.winnerId = '';          // sessionId of the top-scoring pilot ('' = draw / nobody scored)
     this.winnerName = '';        // that pilot's call sign (snapshot, survives them leaving)
     this.winnerKills = 0;        // that pilot's kill count at match end
@@ -287,4 +296,5 @@ defineTypes(ArenaState, {
   winnerId: 'string',
   winnerName: 'string',
   winnerKills: 'uint16',
+  demoBotsEnabled: 'boolean',
 });
