@@ -11,7 +11,7 @@ import { segmentSphereTime } from '../shared/capitalFireControl.js';
 // leave. Shooting, damage, death/respawn, scoring, and win conditions are Phase 2+ and are called
 // out with TODO markers where they'll slot in.
 import { Room } from '@colyseus/core';
-import { ArenaState, Ship, Bolt, Missile, Cargo } from './schema.js';
+import { ArenaState, Ship, Bolt, Missile, Cargo, ARENA_CHAFF_CAPACITY } from './schema.js';
 import { stepShip, forwardFromQuat, yawQuatToward, FLIGHT } from '../shared/flightModel.js';
 import { sanitizeShip, statsFor } from './shipStats.js';
 // ---- DEMO-ONLY (REMOVE BEFORE SHIP) ----------------------------------------------------------
@@ -96,6 +96,10 @@ const MISSILE_HIT_RADIUS = 7;       // proximity-fuse blast radius
 // a plausible warhead proximity fuse: a bit larger than a bolt's hull test since a warhead has real
 // blast area, but tight enough that it only fuses on a target it genuinely reaches.)
 const MISSILE_COOLDOWN = 1.4;       // min seconds between a player's missile shots
+const CHAFF_LIFETIME = 2.2;         // matches the client's three-mote chaff cloud
+const CHAFF_RADIUS = 60;
+const CHAFF_DRAG_PER_TICK = 0.25 ** FIXED_DT;
+const CHAFF_CLOSE_IMMUNITY = 70;    // player-fired missiles ignore chaff this close to their target
 const MAX_MISSILES = 120;           // hard cap on live missiles (safety)
 // Authoritative loadout economy: a pilot starts each life with their hull's rack (shipStats.missiles),
 // spends one per launch (a launch with an empty rack is REJECTED server-side), and earns one back for
@@ -283,6 +287,7 @@ export class ArenaRoom extends Room {
     // sessionId (the intent) — the server validates it's a live hostile, spawns the missile from the
     // shooter's nose, and homes + damages it authoritatively. Rate-limited server-side.
     this.onMessage('missile', (client, msg) => this.tryFireMissile(client.sessionId, msg && msg.target));
+    this.onMessage('chaff', client => this.deployChaff(client.sessionId));
 
     // CSA: a client reports the authored hardpoint manifest of a loaded capital hull (the server has
     // no GLB loader). CapitalAssault validates it and keeps the first good one per team.
@@ -417,6 +422,7 @@ export class ArenaRoom extends Room {
 
     this._boltSeq = 0;   // monotonically increasing id source for bolt map keys
     this._missileSeq = 0; // monotonically increasing id source for missile map keys
+    this._chaffClouds = [];
     this._probeSeq = 0;  // monotonically increasing id source for RTT netprobes
     this._now = 0;       // accumulated sim time in seconds (for cooldowns / regen / respawn timers)
     this._collideCd = new Map(); // "sidA|sidB" -> sim time a ram-pair may next collide-damage
@@ -873,16 +879,18 @@ export class ArenaRoom extends Room {
       const a = live[i];
       for (let j = i + 1; j < live.length; j++) {
         const b = live[j];
-        let dx = b.s.pos.x - a.s.pos.x;
-        let dy = b.s.pos.y - a.s.pos.y;
-        let dz = b.s.pos.z - a.s.pos.z;
+        const dx = b.s.pos.x - a.s.pos.x;
+        const dy = b.s.pos.y - a.s.pos.y;
+        const dz = b.s.pos.z - a.s.pos.z;
         const d2 = dx * dx + dy * dy + dz * dz;
         if (d2 >= minSep2) continue;   // no overlap
 
         // Contact normal (from a -> b). Guard the degenerate exact-overlap case with a fallback axis.
-        let dist = Math.sqrt(d2);
-        if (dist < 1e-4) { dx = 1; dy = 0; dz = 0; dist = 1e-4; }
-        const nx = dx / dist, ny = dy / dist, nz = dz / dist;
+        const dist = Math.sqrt(d2);
+        let nx = 1, ny = 0, nz = 0;
+        if (dist >= 1e-4) {
+          nx = dx / dist; ny = dy / dist; nz = dz / dist;
+        }
 
         // Separate the pair so they no longer overlap (split the correction evenly), plus a little
         // extra push. Do this EVERY overlapping tick (even during cooldown) so they don't stay lodged.
@@ -941,13 +949,15 @@ export class ArenaRoom extends Room {
       if (!s) continue;
       for (const base of bases) {
         const b = base.c, r = base.r, r2 = r * r;
-        let dx = s.pos.x - b.x, dy = s.pos.y - b.y, dz = s.pos.z - b.z;
+        const dx = s.pos.x - b.x, dy = s.pos.y - b.y, dz = s.pos.z - b.z;
         const d2 = dx * dx + dy * dy + dz * dz;
         if (d2 >= r2) continue;   // outside the hull envelope
-        let dist = Math.sqrt(d2);
+        const dist = Math.sqrt(d2);
         // Degenerate exact-center case: shove straight up along +Y so we never divide by zero.
-        if (dist < 1e-4) { dx = 0; dy = 1; dz = 0; dist = 1e-4; }
-        const nx = dx / dist, ny = dy / dist, nz = dz / dist;
+        let nx = 0, ny = 1, nz = 0;
+        if (dist >= 1e-4) {
+          nx = dx / dist; ny = dy / dist; nz = dz / dist;
+        }
         // Push out to the surface plus a small pad.
         const push = (r - dist) + BASE_COLLIDE_PUSH;
         s.pos.x += nx * push; s.pos.y += ny * push; s.pos.z += nz * push;
@@ -1055,10 +1065,59 @@ export class ArenaRoom extends Room {
     return true;
   }
 
+  deployChaff(sid) {
+    const ship = this.state.ships.get(sid);
+    if (this.state.matchState !== 'live' || !ship?.alive || !ship.connected || ship.chaff <= 0) return;
+    const sim = this.sim.get(sid);
+    if (!sim) return;
+    const nose = forwardFromQuat(sim.quat);
+    const cloud = {
+      owner: sid, team: ship.team, expiresAt: this._now + CHAFF_LIFETIME,
+      px: sim.pos.x - 2 * nose.x, py: sim.pos.y - 2 * nose.y, pz: sim.pos.z - 2 * nose.z,
+      vx: sim.vel.x * 0.4, vy: sim.vel.y * 0.4, vz: sim.vel.z * 0.4
+    };
+    this._chaffClouds.push(cloud);
+    ship.chaff--;
+    this.broadcast('chaffDeployed', {owner:sid, x:cloud.px, y:cloud.py, z:cloud.pz,
+      vx:sim.vel.x, vy:sim.vel.y, vz:sim.vel.z, remaining:ship.chaff});
+  }
+
+  // A cloud can lure a seeker away from a wingmate in team modes. In FFA any other pilot's
+  // cloud can divert it. The original target can be reacquired once the decoy stops working.
+  missileAimPoint(id, m, target, ffa) {
+    if (m._decoy && (this._now >= m._decoyUntil || this._now >= m._decoy.expiresAt)) {
+      m._decoy = null;
+      m.decoyed = false;
+    }
+    if (m._decoy) return m._decoy;
+    if (!this._chaffClouds.length) return target;
+    const dist = Math.hypot(target.px - m.px, target.py - m.py, target.pz - m.pz);
+    if (this.state.ships.has(m.owner) && dist < CHAFF_CLOSE_IMMUNITY) return target;
+    const cloud = this._chaffClouds.find(c => c.owner !== m.owner && (ffa || c.team !== m.team) &&
+      Math.hypot(c.px - m.px, c.py - m.py, c.pz - m.pz) < CHAFF_RADIUS);
+    if (cloud && Math.random() < 0.55) {
+      m._decoy = cloud;
+      m._decoyUntil = this._now + 0.9 + Math.random() * 0.6;
+      m.decoyed = true;
+      this.broadcast('missileDecoyed', {missile:id, owner:m.owner, target:m.target, defender:cloud.owner});
+      return cloud;
+    }
+    return target;
+  }
+
   // Home every missile toward its locked target (turn-rate limited), advance it, and proximity-fuse
   // against any live hostile within blast radius. Expires by lifetime. Detonation deals a heavy hit.
   advanceMissiles() {
     const ffa = this.isFFA();   // FFA: a missile homes on / fuses against any live non-owner ship
+    for (let i = this._chaffClouds.length - 1; i >= 0; i--) {
+      const cloud = this._chaffClouds[i];
+      if (this._now >= cloud.expiresAt) {
+        this._chaffClouds.splice(i, 1);
+        continue;
+      }
+      cloud.px += cloud.vx * FIXED_DT; cloud.py += cloud.vy * FIXED_DT; cloud.pz += cloud.vz * FIXED_DT;
+      cloud.vx *= CHAFF_DRAG_PER_TICK; cloud.vy *= CHAFF_DRAG_PER_TICK; cloud.vz *= CHAFF_DRAG_PER_TICK;
+    }
     for (const [id, m] of this.state.missiles) {
       m._ttl -= FIXED_DT;
 
@@ -1067,7 +1126,8 @@ export class ArenaRoom extends Room {
       // then re-normalized to cruise speed so the dart keeps a constant speed while it homes.
       const tgt = m.target && this.state.ships.get(m.target);
       if (tgt && tgt.alive && (ffa || tgt.team !== m.team)) {
-        const tx = tgt.px - m.px, ty = tgt.py - m.py, tz = tgt.pz - m.pz;
+        const aim = this.missileAimPoint(id, m, tgt, ffa);
+        const tx = aim.px - m.px, ty = aim.py - m.py, tz = aim.pz - m.pz;
         const td = Math.sqrt(tx * tx + ty * ty + tz * tz) || 1;
         const dx = tx / td, dy = ty / td, dz = tz / td;
         const sp = Math.sqrt(m.vx * m.vx + m.vy * m.vy + m.vz * m.vz) || 1;
@@ -1086,6 +1146,8 @@ export class ArenaRoom extends Room {
         m.vx = vx * MISSILE_SPEED; m.vy = vy * MISSILE_SPEED; m.vz = vz * MISSILE_SPEED;
       } else if (m.target) {
         m.target = '';   // target died / left / same team now — go ballistic
+        m._decoy = null;
+        m.decoyed = false;
       }
 
       // Advance along the (possibly re-steered) velocity.
@@ -1116,7 +1178,7 @@ export class ArenaRoom extends Room {
         if (time !== null && time < first) { first = time; hit = { sid, ship }; }
       }
       if (hit) {
-        this.damageShip(hit.sid, hit.ship, m._damage ?? MISSILE_DAMAGE, m.owner);
+        this.damageShip(hit.sid, hit.ship, m._damage ?? MISSILE_DAMAGE, m.owner, true);
         this.broadcast('missileHit', { x: from.x + (nx - from.x) * first, y: from.y + (ny - from.y) * first,
           z: from.z + (nz - from.z) * first, owner: m.owner, victim: hit.sid });
         consumed = true;
@@ -1522,7 +1584,7 @@ export class ArenaRoom extends Room {
   // Apply damage to a ship: shields absorb first, then hull. Credits a kill on destruction.
   // Broadcasts a 'hit' event so BOTH the shooter (hit-marker "you connected") and the victim
   // (damage flash / "you're taking fire") get immediate feedback, independent of the kill event.
-  damageShip(sid, ship, dmg, attackerId) {
+  damageShip(sid, ship, dmg, attackerId, missile = false) {
     if (this.state.matchState === 'ended') return;
     const s = this.sim.get(sid);
     if (s) s.lastHitAt = this._now;
@@ -1538,6 +1600,7 @@ export class ArenaRoom extends Room {
     // and cheap). `lethal` lets the shooter skip the plain hit-marker when the kill event covers it.
     this.broadcast('hit', {
       attacker: attackerId, victim: sid, shield: shieldHit, lethal,
+      ...(missile ? {missile:true} : {}),
       x: ship.px, y: ship.py, z: ship.pz,
     });
     if (lethal) this.killShip(sid, ship, attackerId);
@@ -1700,6 +1763,7 @@ export class ArenaRoom extends Room {
     ship.shields = s.maxShields || 100;
     // Fresh life = fresh loadout: full missile rack, and the kill-streak resupply counter resets.
     ship.missiles = s.maxMissiles || ship.maxMissiles || 4;
+    ship.chaff = ARENA_CHAFF_CAPACITY;
     s.killStreak = 0;
     ship.alive = true;
     ship.respawnIn = 0;          // alive again — clear the replicated countdown
@@ -1779,6 +1843,7 @@ export class ArenaRoom extends Room {
   }
 
   startMatch() {
+    this._chaffClouds.length = 0;
     this.state.matchState = 'live';
     this.state.timeLeft = this.state.roundDuration;
     this.state.blueKills = 0;

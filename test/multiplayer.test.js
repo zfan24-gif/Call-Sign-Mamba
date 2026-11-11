@@ -11,6 +11,7 @@ function fixture(mode) {
   room.state.mode = mode;
   room.state.matchState = 'live';
   room.sim = new Map();
+  room._chaffClouds = [];
   room.events = [];
   room.broadcast = (type, data) => room.events.push({type, data});
   room._now = 10;
@@ -26,6 +27,83 @@ function ship(room, id, team, pos = 0) {
   return pilot;
 }
 
+test('a bolt and missile report the real victim shield in separate damage events', () => {
+  const room = fixture('ffa');
+  ship(room, 'attacker', 0, -50);
+  const victim = ship(room, 'defender', 1, 0);
+  victim.shields = 150;
+  for (const [weapon, rounds] of [[new Bolt(),room.state.bolts],[new Missile(),room.state.missiles]]) {
+    Object.assign(weapon, {owner:'attacker',team:0,px:-12,py:0,pz:0,vx:300,vy:0,vz:0,_ttl:2});
+    rounds.set('round',weapon);
+  }
+  room.advanceBolts();
+  const afterBolt = victim.shields;
+  room.advanceMissiles();
+  const hits = room.events.filter(e => e.type === 'hit').map(e => e.data);
+  assert.equal(hits.length, 2);
+  assert.equal(hits[0].missile, undefined);
+  assert.equal(hits[1].missile, true);
+  for (const hit of hits) {
+    assert.equal(hit.attacker,'attacker'); assert.equal(hit.victim,'defender');
+    assert.equal(hit.shield,true); assert.equal(hit.lethal,false);
+  }
+  assert(afterBolt < 150);
+  assert.equal(victim.shields, afterBolt - 120);
+  assert.deepEqual(room.events.filter(e => e.type === 'missileHit').map(e => e.data.victim), ['defender']);
+  victim.shields = 0;
+  room.damageShip('defender',victim,10,'attacker',true);
+  assert.equal(room.events.at(-1).data.shield,false);
+});
+
+test('chaff spends one authoritative charge only in an active, connected life', () => {
+  const room = fixture('ffa');
+  const defender = ship(room, 'defender', 0);
+  const sim = room.sim.get('defender');
+  sim.quat = {x:0,y:0,z:0,w:1};
+  room.state.matchState = 'lobby';
+  room.deployChaff('defender');
+  room.state.matchState = 'live';
+  defender.connected=false;room.deployChaff('defender');defender.connected=true;
+  defender.alive=false;room.deployChaff('defender');defender.alive=true;
+  assert.equal(defender.chaff,6);
+  for (let i=0;i<8;i++) room.deployChaff('defender');
+  assert.equal(defender.chaff,0);
+  assert.deepEqual(room.events.map(e=>e.data.remaining),[5,4,3,2,1,0]);
+  room._now += 3;
+  room.advanceMissiles();
+  assert.equal(room._chaffClouds.length,0);
+  sim.inputs=[];sim.history=[];
+  room.respawnShip('defender',defender,sim);
+  assert.equal(defender.chaff,6);
+});
+
+test('a diverted seeker steers toward the enemy cloud and can reacquire its target', (t) => {
+  const room=fixture('ctc');
+  ship(room,'attacker',0,-100);
+  const defender=ship(room,'defender',1,100);
+  const missile=new Missile();
+  Object.assign(missile,{owner:'attacker',team:0,target:'defender',vx:0,vz:300,_ttl:6});
+  room.state.missiles.set('m1',missile);
+  room._chaffClouds.push({owner:'defender',team:1,px:-30,py:0,pz:0,vx:0,vy:0,vz:0,expiresAt:room._now+2.2});
+  t.mock.method(Math,'random',()=>0);
+  room.advanceMissiles();
+  assert.equal(missile.decoyed,true);
+  assert.equal(missile.target,'defender');
+  assert(missile.vx<0);
+  assert.deepEqual(room.events[0],{type:'missileDecoyed',data:{missile:'m1',owner:'attacker',target:'defender',defender:'defender'}});
+  room._now+=3;room.advanceMissiles();
+  assert.equal(missile.decoyed,false);
+  assert.equal(missile.target,'defender');
+  assert.equal(defender.hull,100);
+  // Player shots inside the existing 70-unit immunity range stay on the defender.
+  missile.px=50;missile.pz=0;
+  room._chaffClouds.push({owner:'defender',team:1,px:50,py:0,pz:0,vx:0,vy:0,vz:0,expiresAt:room._now+2.2});
+  room.advanceMissiles();assert.equal(missile.decoyed,false);
+  // A friendly pilot's cloud cannot divert a team missile.
+  missile.px=0;room._chaffClouds[0].team=0;
+  room.advanceMissiles();assert.equal(missile.decoyed,false);
+});
+
 test('wingmate collision reports the death without personal, team or resupply credit', () => {
   const room=fixture('ctc');
   const victim=ship(room,'victim',0), other=ship(room,'wingmate',0,4);
@@ -34,6 +112,38 @@ test('wingmate collision reports the death without personal, team or resupply cr
   room.resolveShipCollisions();
   const kill=room.events.find(e=>e.type==='kill').data;
   assert.deepEqual([victim.deaths,other.kills,room.state.blueKills,kill.credited,kill.missileResupply],[1,0,0,false,0]);
+});
+
+test('a pair at one spawn point separates by hull size and stays in the arena', () => {
+  const room = fixture('sdm');
+  room._collideCd = new Map();
+  const first = ship(room, 'first', 0, -260);
+  const second = ship(room, 'second', 0, -260);
+  room.resolveShipCollisions();
+  assert(Math.abs(first.px - (-264.2)) < 0.001);
+  assert(Math.abs(second.px - (-255.8)) < 0.001);
+  assert.equal(first.py, second.py);
+  assert.equal(first.pz, second.pz);
+  room.resolveShipCollisions();
+  assert.equal(room.events.filter(e => e.type === 'hit').length, 2);
+});
+
+test('capital-center and off-axis collisions reach the surface and preserve tangential speed', () => {
+  for (const [mode, team, radius] of [['ctc',0,40],['ctc',1,62],['csa',0,62]]) {
+    const room=fixture(mode), origin=room.baseCenter(team);
+    const pilot=ship(room,'pilot',team,origin.x);
+    const sim=room.sim.get('pilot');
+    Object.assign(sim.pos,origin);Object.assign(sim.vel,{x:3,y:-20,z:4});
+    room.resolveBaseCollisions();
+    assert.deepEqual([pilot.px,pilot.py,pilot.pz],[origin.x,origin.y+radius+2,origin.z]);
+    assert.deepEqual([pilot.vx,pilot.vy,pilot.vz],[3,0,4]);
+    Object.assign(sim.pos,{x:origin.x+10,y:origin.y,z:origin.z});
+    Object.assign(sim.vel,{x:-11,y:5,z:4});
+    room.resolveBaseCollisions();
+    assert.deepEqual([pilot.px,pilot.py,pilot.pz],[origin.x+radius+2,origin.y,origin.z]);
+    assert.deepEqual([pilot.vx,pilot.vy,pilot.vz],[0,5,4]);
+    assert.equal(pilot.hull,100);
+  }
 });
 
 test('missile messages report only real grants in FFA and in team play', () => {

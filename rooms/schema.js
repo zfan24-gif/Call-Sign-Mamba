@@ -7,6 +7,7 @@
 // We use the `defineTypes()` form (rather than TypeScript `@type` decorators) so this runs as plain
 // ESM Node with no build step.
 import { Schema, MapSchema, defineTypes } from '@colyseus/schema';
+export const ARENA_CHAFF_CAPACITY = 6;
 // (Cargo is declared below and referenced in ArenaState's cargo map.)
 
 // One networked ship. `lastSeq` is the input frame number the server has applied for this player;
@@ -70,6 +71,7 @@ export class Ship extends Schema {
     // If > 0, the pilot is outside the arena boundaries and has this many seconds to return before
     // their ship is destroyed by the arena perimeter defenses. 0 means in-bounds.
     this.connected = true;
+    this.chaff = ARENA_CHAFF_CAPACITY;
     this.oobTimer = 0;
   }
 }
@@ -101,6 +103,7 @@ defineTypes(Ship, {
   carrying: 'boolean',
   oobTimer: 'float32',
   connected: 'boolean',
+  chaff: 'uint8',
 });
 
 // ---- Capture the Cargo: the SINGLE neutral cargo pod (the "flag") ------------------------------
@@ -216,6 +219,7 @@ export class Missile extends Schema {
     this.owner = '';         // shooter sessionId (never self-hit; credits the kill)
     this.team = 0;           // shooter's team (no friendly fire)
     this.target = '';        // locked victim sessionId ('' = dumbfire, flies straight)
+    this.decoyed = false;    // currently seeking a chaff cloud instead of this target
     this.px = 0; this.py = 0; this.pz = 0;
     this.vx = 0; this.vy = 0; this.vz = 0;
   }
@@ -226,6 +230,7 @@ defineTypes(Missile, {
   target: 'string',
   px: 'float32', py: 'float32', pz: 'float32',
   vx: 'float32', vy: 'float32', vz: 'float32',
+  decoyed: 'boolean',
 });
 
 // Room-level state: ships + live bolts, plus a running team headcount for lobby display, and the
