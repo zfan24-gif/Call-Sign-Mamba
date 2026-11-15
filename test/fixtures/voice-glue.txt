@@ -1,0 +1,47 @@
+let voiceGeneration = 0;
+let voiceAttempt = null;
+multiplayer.onVoiceConnection = (room) => {
+  voiceGeneration++;
+  voiceAttempt?.controller.abort();
+  voiceAttempt = null;
+  multiplayer.setTalking(false);
+  multiplayer.setMicPresence(false);
+  voice.disconnect();
+  voice.stopMicMonitor();
+  if (room) connectVoiceAudio();
+};
+async function connectVoiceAudio() {
+  const room = multiplayer.room;
+  if (!multiplayer.connected || !room || voice.connected) return;
+  if (voiceAttempt?.room === room) return voiceAttempt.promise;
+  const generation = voiceGeneration;
+  const controller = new AbortController();
+  const current = () => generation === voiceGeneration && multiplayer.connected && multiplayer.room === room;
+  const attempt = { room, controller, promise: null };
+  voiceAttempt = attempt;
+  attempt.promise = (async () => {
+    const cfg = await requestArenaVoiceToken(room, { signal: controller.signal });
+    if (!current()) return;
+    if (!cfg) {
+      voice.status = 'unavailable'; voice.reason = 'no-token';
+      setVoiceHudStatus(); multiplayer.setMicPresence(false); return;
+    }
+    voice.onVoxActive = (active) => {
+      if (!current()) return;
+      multiplayer.setTalking(active);
+      setVoiceHud(active);
+      if ($('mpLobby').classList.contains('show')) renderLobbyRosters();
+    };
+    await voice.connect(cfg.url, cfg.token);
+    if (!current()) return;
+    voice.startMicMonitor();
+    setVoiceHudStatus();
+    const announceMic = () => {
+      if (current()) multiplayer.setMicPresence(voice.hasMic() || voice.monitorActive());
+    };
+    announceMic();
+    setTimeout(announceMic, 800);
+    applyVoiceMode();
+  })().finally(() => { if (voiceAttempt === attempt) voiceAttempt = null; });
+  return attempt.promise;
+}

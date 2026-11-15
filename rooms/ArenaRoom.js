@@ -11,6 +11,7 @@ import { segmentSphereTime } from '../shared/capitalFireControl.js';
 // leave. Shooting, damage, death/respawn, scoring, and win conditions are Phase 2+ and are called
 // out with TODO markers where they'll slot in.
 import { Room } from '@colyseus/core';
+import { VoiceAccess } from '../voice/VoiceAccess.js';
 import { ArenaState, Ship, Bolt, Missile, Cargo, ARENA_CHAFF_CAPACITY } from './schema.js';
 import { stepShip, forwardFromQuat, yawQuatToward, FLIGHT } from '../shared/flightModel.js';
 import { sanitizeShip, statsFor } from './shipStats.js';
@@ -248,6 +249,8 @@ export class ArenaRoom extends Room {
   onCreate(options) {
     this.maxClients = MAX_CLIENTS;
     this.setState(new ArenaState());
+    this.voiceAccess = new VoiceAccess(this, this.voiceBackend);
+    this.onMessage('voiceToken', client => { void this.voiceAccess.request(client); });
     console.log(`[arena] room CREATED (roomId=${this.roomId})`);
     // Per-player server-side scratch: authoritative kinematic state + a small input buffer. Kept
     // OFF the synced schema (plain JS) so we only replicate the final pose, not the input plumbing.
@@ -593,6 +596,7 @@ export class ArenaRoom extends Room {
     }
 
     this.state.ships.set(client.sessionId, ship);
+    this.voiceAccess?.join(client);
     if (team === 0) this.state.blueCount++; else this.state.redCount++;
 
     // First pilot in the room becomes the HOST — the one who configures the mode/settings and
@@ -633,6 +637,7 @@ export class ArenaRoom extends Room {
   }
 
   async onLeave(client, consented) {
+    this.voiceAccess?.leave(client);
     const sid = client.sessionId;
     const ship = this.state.ships.get(sid);
     if (!ship) return;
@@ -641,6 +646,7 @@ export class ArenaRoom extends Room {
       // controls and drop carried objectives so a missing pilot cannot fly or score.
       ship.connected = false;
       ship.speaking = false;
+      ship.micState = 0;
       const sim = this.sim.get(sid);
       sim.inputs.length = 0;
       sim.lastInput = IDLE_INPUT;
@@ -651,6 +657,7 @@ export class ArenaRoom extends Room {
       try {
         const restored = await this.allowReconnection(client, RECONNECT_GRACE_SECONDS);
         ship.connected = true;
+        this.voiceAccess?.join(restored);
         this.observeClose(restored);
         console.info('[arena] seat restored', { room: this.roomId, pilot: sid });
         return;
@@ -665,6 +672,7 @@ export class ArenaRoom extends Room {
     // The room lifecycle exposes only a consent flag in Colyseus 0.15. Capture
     // the wire close code as well, without logging tokens or request URLs.
     client.ref?.once?.('close', code => {
+      this.voiceAccess?.leave(client);
       console.info('[arena] socket closed', { room: this.roomId, pilot: client.sessionId, code, unansweredPings: client.ref?.pingCount ?? null });
     });
   }
@@ -1963,7 +1971,9 @@ export class ArenaRoom extends Room {
   // Room teardown: cancel the demo squadron's pending join/ready timers so no setTimeout fires into a
   // disposed room. DEMO-ONLY (REMOVE BEFORE SHIP) — safe to delete with the rest of the bot wiring.
   onDispose() {
+    const removal = this.voiceAccess?.dispose();
     if (this.demoBots) this.demoBots.clear();
+    return removal;
   }
 }
 

@@ -1,0 +1,516 @@
+// ---- Managed voice-audio transport (LiveKit) -------------------------------------------------
+// This is the ACTUAL VOICE AUDIO layer for the arena, sitting alongside the Colyseus presence
+// layer (which owns the "who is speaking" indicators / speaking brackets). LiveKit's hosted SFU
+// carries the audio; Colyseus still carries the presence flags. They run in parallel — nothing in
+// the presence code changes.
+//
+// FLOW:
+//   1. connect(url, token)   — join a LiveKit room, publish the mic track MUTED (idle).
+//   2. setMicEnabled(bool)   — push-to-talk down/up flips the local mic track mute on/off.
+//   3. remote tracks         — every other pilot's audio is auto-subscribed and attached to a
+//                              hidden <audio> element so it plays (flat stereo, no spatialization).
+//   4. disconnect()          — tear the room down on leaving the arena.
+//
+// GRACEFUL DEGRADATION: if the SDK can't load, no token is minted, or the mic is denied, every
+// method no-ops and connected stays false — the match still runs, just without live voice. The
+// Colyseus speaking indicators keep working regardless, so a pilot with no mic still SEES who's
+// talking; they just can't hear/be heard.
+
+// The LiveKit browser SDK, pinned via the importmap in index.html. Imported dynamically inside
+// connect() so a failed CDN fetch degrades gracefully instead of breaking module load.
+let _lk = null;
+
+// Mic-sensitivity -> speaking-threshold mapping lives in settings.js so the pause-menu slider, the
+// lobby mic-green light, and this VOX gate all share ONE source of truth.
+import { micTalkThreshold, micReleaseThreshold } from './settings.js';
+
+// Request credentials only through the joined arena connection. No HTTP fallback.
+export function requestArenaVoiceToken(room, { signal, timeoutMs = 10000 } = {}) {
+  if (!room || signal?.aborted) return Promise.resolve(null);
+  return new Promise(resolve => {
+    let settled = false, timer, offMessage;
+    const finish = value => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (typeof offMessage === 'function') offMessage();
+      room.onLeave?.remove?.(onLeave);
+      signal?.removeEventListener('abort', onAbort);
+      resolve(value);
+    };
+    const onLeave = () => finish(null);
+    const onAbort = () => finish(null);
+    try {
+      offMessage = room.onMessage('voiceToken', data => {
+        finish(data && !data.error && typeof data.url === 'string' && data.url &&
+          typeof data.token === 'string' && data.token ? { url: data.url, token: data.token } : null);
+      });
+      room.onLeave?.(onLeave);
+      signal?.addEventListener('abort', onAbort, { once: true });
+      timer = setTimeout(() => finish(null), timeoutMs);
+      if (signal?.aborted) finish(null);
+      else room.send('voiceToken');
+    } catch { finish(null); }
+  });
+}
+
+export class VoiceTransport {
+  constructor() {
+    this.room = null;
+    this.connected = false;
+    this.micTrack = null;        // our published local microphone track
+    this.micEnabled = false;     // true while push-to-talk is held (track unmuted)
+    this._audioEls = new Map();   // participantSid -> HTMLAudioElement for each remote track
+    this._connecting = false;
+    this._generation = 0;
+    this._monitorGeneration = 0;
+    this._voxGeneration = 0;
+    // Browser autoplay gate: true when remote voice is subscribed but the browser is blocking it
+    // from actually playing (no qualifying user gesture yet). unlockPlayback(), called from a real
+    // pointer/key gesture, calls room.startAudio() to lift the gate; the flag clears when audio flows.
+    this.audioBlocked = false;
+    // Playback volume (0..1) applied to EVERY remote voice <audio> element. Driven by the Voice Chat
+    // Volume slider in settings; new remote tracks inherit it on subscribe. Independent of the game mix.
+    this._remoteVolume = 1;
+    // --- Voice-activity detection (VOX / "speak to activate") ---
+    // When VOX is enabled we keep the mic track UNMUTED and instead gate transmission by monitoring
+    // the input level with a WebAudio AnalyserNode: while the smoothed level sits above a threshold
+    // the pilot is "speaking" and the track stays live; below it (after a short hangover so words
+    // aren't clipped) we mute. `onVoxActive(bool)` fires on the speaking edge so main.js can drive the
+    // same presence flag + HUD that push-to-talk uses. PTT mode leaves all of this dormant.
+    this.voxEnabled = false;
+    this.onVoxActive = null;      // callback(active:boolean) on VOX speaking transitions
+    this._voxCtx = null;          // AudioContext for the analyser
+    this._voxAnalyser = null;
+    this._voxData = null;         // Uint8Array time-domain scratch
+    this._voxRAF = null;
+    this._voxActive = false;      // current VOX speaking state
+    // --- Mic self-test monitor (see startMicMonitor) --- independent of VOX AND of LiveKit's muted
+    // publish track; runs on its own getUserMedia stream so it reads real input even between transmits.
+    this._monCtx = null; this._monAnalyser = null; this._monData = null; this._monLevel = 0; this._monPeak = 0;
+    this._monStream = null; this._monStarting = false; this._monTornDown = false;
+    this._voxAboveSince = 0;      // timestamp level first crossed the open threshold
+    this._voxBelowSince = 0;      // timestamp level first dropped under the close threshold
+    // Coarse status the HUD reads to explain the current voice state to the pilot:
+    //   'off'         — no connect attempt yet (menus / not in a match)
+    //   'connecting'  — join in progress
+    //   'live'        — connected AND mic published (can hear + transmit)
+    //   'listen-only' — connected but mic denied/unavailable (can hear, can't transmit)
+    //   'unavailable' — SDK failed / no token / connect failed (presence-only, no live audio)
+    this.status = 'off';
+    // Fine-grained reason for a non-'live' state, so the HUD can tell the pilot WHICH wall they hit
+    // instead of a generic "voice off". Values:
+    //   ''            — no problem (or not yet attempted)
+    //   'mic-blocked' — getUserMedia rejected by browser/iframe Permissions-Policy (needs allow="microphone")
+    //   'mic-denied'  — pilot explicitly declined the mic prompt
+    //   'no-mic'      — no microphone device present
+    //   'no-token'    — server minted no LiveKit token (voice not configured / offline)
+    //   'connect-failed' — SDK load or room.connect() failed
+    //   'audio-blocked'  — connected + mic fine, but browser autoplay gate is still muting remotes
+    this.reason = '';
+  }
+
+  // Map a getUserMedia / createLocalAudioTrack failure to one of our coarse reason codes. The
+  // iframe Permissions-Policy rejection and an explicit user "Block" both surface as NotAllowedError,
+  // so we disambiguate on the message text LiveKit/the browser provides.
+  _classifyMicError(err) {
+    const name = (err && err.name) || '';
+    const msg = ((err && err.message) || '').toLowerCase();
+    if (name === 'NotAllowedError' || name === 'SecurityError') {
+      // Permissions-Policy / disallowed-context wording => the embedding page didn't grant mic.
+      if (msg.includes('permission') && (msg.includes('policy') || msg.includes('context') || msg.includes('platform') || msg.includes('user agent') || msg.includes('disallow'))) {
+        return 'mic-blocked';
+      }
+      return 'mic-denied';   // otherwise the pilot clicked "Block" on the prompt
+    }
+    if (name === 'NotFoundError' || name === 'OverconstrainedError' || msg.includes('no device') || msg.includes('not found')) {
+      return 'no-mic';
+    }
+    return 'mic-denied';
+  }
+
+  // Join the LiveKit room and publish the mic MUTED. `url` + `token` come from the server token
+  // message on the joined Colyseus connection (see main.js). Never throws — logs + no-ops on any failure.
+  async connect(url, token) {
+    if (this.connected || this._connecting) return;
+    if (!url || !token) { console.info('[voice] no LiveKit url/token — voice audio disabled (presence still works).'); this.status = 'unavailable'; this.reason = 'no-token'; return; }
+    const generation = ++this._generation;
+    const current = () => generation === this._generation;
+    this._connecting = true;
+    this.status = 'connecting';
+    try {
+      if (!_lk) _lk = await import('livekit-client');
+      if (!current()) return;
+      const { Room, RoomEvent, Track } = _lk;
+      this._Track = Track;
+      this._RoomEvent = RoomEvent;
+      const room = new Room({ adaptiveStream: true, dynacast: true });
+      this.room = room;
+
+      // Attach every remote audio track to a hidden <audio> element so it plays. Flat stereo:
+      // we do NOT position the sound in 3D — every teammate is simply audible at full volume.
+      room.on(RoomEvent.TrackSubscribed, (track, _pub, participant) => {
+        if (!current() || this.room !== room || track.kind !== Track.Kind.Audio) return;
+        const el = track.attach();               // creates an <audio> element bound to the stream
+        el.autoplay = true;
+        el.style.display = 'none';
+        el.volume = Math.max(0, Math.min(1, this._remoteVolume));   // inherit the current comms volume
+        document.body.appendChild(el);
+        this._audioEls.set(participant.sid, el);
+        
+        // CRITICAL: Browser autoplay policy often blocks new tracks after a re-join.
+        // Poking the room's audio context here helps "wake up" the new stream.
+        try { Promise.resolve(room.startAudio()).catch(() => {}); } catch {}
+        
+        // Autoplay policy: the element may be blocked from playing until a user gesture unlocks
+        // playback. Kick a play() and, if the room reports playback is still blocked, remember it
+        // so the next user gesture (see unlockPlayback) can resume every element at once.
+        try { const p = el.play(); if (p && p.catch) p.catch(() => {}); } catch {}
+        if (this.room && this.room.canPlaybackAudio === false) this.audioBlocked = true;
+        // Diagnostic: prove the remote voice track actually arrived and whether the browser will let it
+        // play. If this logs but you hear nothing, it's the autoplay gate (tap once) or output routing —
+        // NOT a missing publish. If it never logs, the other pilot never published a mic (their side).
+        console.info(`[voice] subscribed to ${participant.identity || participant.sid}'s audio — canPlay=${this.room ? this.room.canPlaybackAudio : '?'}`);
+      });
+      // LiveKit fires this whenever the browser's autoplay gate changes. If audio can't play yet we
+      // flag it (the HUD/next gesture can prompt/retry); once it can, clear the flag.
+      room.on(RoomEvent.AudioPlaybackStatusChanged, () => {
+        if (current() && this.room === room) this.audioBlocked = room.canPlaybackAudio === false;
+      });
+      room.on(RoomEvent.TrackUnsubscribed, (track, _pub, participant) => {
+        if (!current() || this.room !== room || track.kind !== Track.Kind.Audio) return;
+        track.detach().forEach(el => el.remove());
+        this._audioEls.delete(participant.sid);
+      });
+      room.on(RoomEvent.Disconnected, () => {
+        if (!current() || this.room !== room) return;
+        ++this._generation;
+        this._connecting = false;
+        this.stopMicMonitor();
+        this._teardownLocal();
+        this.status = 'unavailable';
+      });
+
+      await room.connect(url, token);
+      if (!current()) { try { await room.disconnect(); } catch {} return; }
+      this.connected = true;
+
+      // Capture and mute the mic BEFORE publication — the pilot only transmits while
+      // holding push-to-talk. If mic permission is denied, we stay connected (still hear others).
+      try {
+        const micTrack = await _lk.createLocalAudioTrack({
+          echoCancellation: true, noiseSuppression: true, autoGainControl: true,
+        });
+        if (!current()) { micTrack.stop(); return; }
+        this.micTrack = micTrack;
+        await micTrack.mute(); // never publish an initially open microphone
+        if (!current()) { micTrack.stop(); return; }
+        await room.localParticipant.publishTrack(micTrack);
+        if (!current()) { micTrack.stop(); return; }
+        this.micEnabled = false;
+        this.status = 'live';
+        this.reason = '';
+      } catch (micErr) {
+        if (!current()) return;
+        try { this.micTrack?.stop(); } catch {}
+        this.micTrack = null;
+        this.status = 'listen-only';
+        this.reason = this._classifyMicError(micErr);
+        // Spell out the diagnosis so a test session shows WHICH wall was hit, not a generic failure.
+        const detail = this.reason === 'mic-blocked'
+          ? 'blocked by the page/iframe Permissions-Policy (embed needs allow="microphone") — you can hear others but not transmit.'
+          : this.reason === 'mic-denied'
+          ? 'permission was denied — you can hear others but not transmit.'
+          : this.reason === 'no-mic'
+          ? 'no microphone device found — you can hear others but not transmit.'
+          : 'unavailable — you can hear others but not transmit.';
+        console.info(`[voice] microphone ${detail}`, micErr && (micErr.name || ''), micErr && micErr.message);
+      }
+      // Reflect the browser's current autoplay gate. If already blocked here, the first user gesture
+      // routed through unlockPlayback() will lift it; most desktop cases are already unlocked because
+      // the pilot clicked Launch/Deploy before connecting.
+      this.audioBlocked = room.canPlaybackAudio === false;
+      // Best-effort immediate unlock — connect() is often reached shortly after a click, which counts
+      // as a gesture, so this frequently succeeds without any further prompt.
+      this.unlockPlayback();
+      console.info('[voice] connected to LiveKit room — voice audio live.');
+    } catch (err) {
+      if (!current()) return;
+      const failedRoom = this.room;
+      console.info('[voice] could not connect to LiveKit — voice audio disabled (presence still works).', err && err.message);
+      this._teardownLocal();
+      this.status = 'unavailable';
+      this.reason = 'connect-failed';
+      try { await failedRoom?.disconnect(); } catch {}
+    } finally {
+      if (current()) this._connecting = false;
+    }
+  }
+
+  // True when we have a working, published microphone (permission granted). Drives the lobby mic
+  // icon: a live mic vs. a grayed mic with a slash. False when the mic was denied/unavailable or we
+  // aren't connected to voice at all.
+  hasMic() { return this.connected && !!this.micTrack; }
+
+  // Set the playback volume (0..1) for teammates' voice chat. Applies immediately to every attached
+  // remote <audio> element and is remembered so tracks subscribed later inherit it. Clamped to the
+  // valid HTMLMediaElement range. Independent of the game SFX/music mix.
+  setRemoteVolume(v) {
+    this._remoteVolume = Math.max(0, Math.min(1, +v || 0));
+    for (const el of this._audioEls.values()) {
+      try { el.volume = this._remoteVolume; } catch {}
+    }
+  }
+
+  // Lift the browser's autoplay gate on remote voice. MUST be reachable from a real user gesture
+  // (pointerdown/keydown) — LiveKit's room.startAudio() resumes the shared audio context and every
+  // attached <audio> element. Safe to call repeatedly and when not connected (no-ops). This is the
+  // fix for "connected but nobody can hear anyone": tracks subscribe fine, but the browser silently
+  // refuses to play them until this runs inside a gesture.
+  async unlockPlayback() {
+    const room = this.room;
+    if (!room) return;
+    const generation = this._generation;
+    try {
+      if (typeof room.startAudio === 'function') await room.startAudio();
+    } catch {}
+    if (generation !== this._generation || this.room !== room) return;
+    // Also nudge each already-attached element; some browsers need a per-element play() post-unlock.
+    for (const el of this._audioEls.values()) {
+      try { const p = el.play(); if (p && p.catch) p.catch(() => {}); } catch {}
+    }
+    if (this.room !== room) return;
+    this.audioBlocked = room.canPlaybackAudio === false;
+    // If the mic itself is fine (status 'live') but remotes are still gated, surface that distinctly
+    // so the HUD can say "TAP TO HEAR" rather than a mic problem. Clears once audio flows.
+    if (this.status === 'live') this.reason = this.audioBlocked ? 'audio-blocked' : '';
+  }
+
+  // ---- Mic SELF-TEST input monitor ------------------------------------------------------------
+  // A standalone analyser tapping the RAW mic MediaStreamTrack, independent of VOX. It reads the
+  // live input level even while the published track is MUTED (muting stops transmission, not local
+  // capture), so a solo pilot can prove their mic is actually picking up sound before anyone needs to
+  // hear them. getMicLevel() returns a smoothed 0..1 loudness the HUD polls to drive a meter.
+  // Safe to start when there's no mic (no-ops); stops cleanly on disconnect.
+  startMicMonitor() {
+    if (this._monAnalyser || this._monStarting) return;   // already running / in progress
+    // IMPORTANT: the self-test monitor uses its OWN independent getUserMedia stream, NOT LiveKit's
+    // published track. LiveKit mutes the published mic between transmissions (PTT/VOX), and muting a
+    // LiveKit LocalAudioTrack disables its underlying MediaStreamTrack — so tapping that track fed the
+    // analyser silence and the meter never moved even with a working mic. A dedicated capture stream is
+    // immune to LiveKit's mute state and always reflects real input. Requires a mic device + permission
+    // (which the pilot already granted for voice), and no-ops gracefully otherwise.
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
+    this._monTornDown = false;   // fresh start — allow the pending getUserMedia resolve to attach
+    this._monStarting = true;
+    const generation = ++this._monitorGeneration;
+    const connectionGeneration = this._generation;
+    const current = () => generation === this._monitorGeneration && connectionGeneration === this._generation;
+    navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } })
+      .then((stream) => {
+        if (!current()) { try { stream.getTracks().forEach(t => t.stop()); } catch {} return; }
+        this._monStarting = false;
+        if (this._monTornDown) { try { stream.getTracks().forEach(t => t.stop()); } catch {} return; }
+        try {
+          const Ctx = window.AudioContext || window.webkitAudioContext;
+          if (!Ctx) { try { stream.getTracks().forEach(t => t.stop()); } catch {} return; }
+          this._monStream = stream;
+          this._monCtx = new Ctx();
+          // Browsers create AudioContexts SUSPENDED until a gesture is applied; a suspended context
+          // feeds the analyser flatline silence. Resume now (this path is reached via the launch click)
+          // and re-resume defensively in getMicLevel() if the browser suspends it again.
+          try { const rp = this._monCtx.resume(); if (rp && rp.catch) rp.catch(() => {}); } catch {}
+          const src = this._monCtx.createMediaStreamSource(stream);
+          const analyser = this._monCtx.createAnalyser();
+          analyser.fftSize = 512;
+          analyser.smoothingTimeConstant = 0.5;
+          src.connect(analyser);
+          this._monAnalyser = analyser;
+          this._monData = new Uint8Array(analyser.fftSize);
+          this._monLevel = 0;
+          this._monPeak = 0;   // running peak so the pilot sees they DID hit a loud level even if brief
+        } catch (err) {
+          console.info('[voice] mic self-test monitor unavailable.', err && err.message);
+          this.stopMicMonitor();
+        }
+      })
+      .catch((err) => {
+        if (!current()) return;
+        this._monStarting = false;
+        console.info('[voice] mic self-test capture unavailable.', err && (err.name || ''), err && err.message);
+      });
+  }
+  // Sample the monitor analyser and return a smoothed 0..1 input level (0 when no mic / not monitoring).
+  // Call once per HUD frame; it low-passes internally so the meter reads steadily rather than flickering.
+  getMicLevel() {
+    const analyser = this._monAnalyser, data = this._monData;
+    if (!analyser || !data) return 0;
+    // If the browser suspended our monitor context (tab switch / autoplay policy), it would feed the
+    // analyser silence. Nudge it back to running so the meter self-heals without a reconnect.
+    if (this._monCtx && this._monCtx.state === 'suspended') {
+      try { const rp = this._monCtx.resume(); if (rp && rp.catch) rp.catch(() => {}); } catch {}
+    }
+    analyser.getByteTimeDomainData(data);
+    let sum = 0;
+    for (let i = 0; i < data.length; i++) { const v = (data[i] - 128) / 128; sum += v * v; }
+    const raw = Math.sqrt(sum / data.length);   // RMS ~0..1
+    // Smooth upward fast (so speech registers immediately) and decay slower (so the meter is readable).
+    this._monLevel = raw > this._monLevel ? raw : this._monLevel * 0.85 + raw * 0.15;
+    if (this._monLevel > this._monPeak) this._monPeak = this._monLevel;
+    return this._monLevel;
+  }
+  // True once the monitor has ever seen a clearly audible level — proof the mic captured real sound.
+  micHeardSound() { return (this._monPeak || 0) >= 0.06; }
+  // True when the self-test monitor is actually capturing input (its own stream + analyser are live).
+  // Independent of the LiveKit publish state, so the meter shows even if transmit publish was denied.
+  monitorActive() { return !!this._monAnalyser; }
+  // Instantaneous (un-smoothed) RMS level from the monitor's OWN capture stream. Used by VOX so
+  // speech detection reads a live, always-on mic instead of LiveKit's muted publish track (a muted
+  // LiveKit track disables its MediaStreamTrack, feeding any analyser tapping it pure silence — the
+  // reason VOX never opened and the lobby mic never lit green). Returns 0 when not monitoring.
+  monitorRawLevel() {
+    const analyser = this._monAnalyser, data = this._monData;
+    if (!analyser || !data) return 0;
+    if (this._monCtx && this._monCtx.state === 'suspended') {
+      try { const rp = this._monCtx.resume(); if (rp && rp.catch) rp.catch(() => {}); } catch {}
+    }
+    analyser.getByteTimeDomainData(data);
+    let sum = 0;
+    for (let i = 0; i < data.length; i++) { const v = (data[i] - 128) / 128; sum += v * v; }
+    return Math.sqrt(sum / data.length);
+  }
+  stopMicMonitor() {
+    ++this._monitorGeneration;
+    this._monStarting = false;
+    this._monTornDown = true;   // so an in-flight getUserMedia resolve stops its stream instead of using it
+    if (this._monStream) { try { this._monStream.getTracks().forEach(t => t.stop()); } catch {} this._monStream = null; }
+    if (this._monCtx) { try { this._monCtx.close(); } catch {} this._monCtx = null; }
+    this._monAnalyser = null;
+    this._monData = null;
+    this._monLevel = 0;
+    this._monPeak = 0;
+  }
+
+  // Push-to-talk: unmute the mic while held, mute on release. No-op if we never published a track
+  // (SDK failed / mic denied), so the presence layer still drives the indicators without audio.
+  setMicEnabled(on) {
+    const want = !!on;
+    if (want === this.micEnabled) return;
+    this.micEnabled = want;
+    const track = this.micTrack, generation = this._generation;
+    if (!track) return;
+    try {
+      Promise.resolve(want ? track.unmute() : track.mute()).then(() => {
+        if (generation !== this._generation || this.micTrack !== track) track.stop();
+      }).catch(() => {});
+    } catch {}
+  }
+
+  // Enable/disable VOICE-ACTIVATED transmission ("speak to activate"). In VOX mode we hand control of
+  // the mic mute to the analyser loop instead of push-to-talk. Enabling with no published mic (denied)
+  // no-ops gracefully. Disabling stops the loop and mutes the track so PTT can take over cleanly.
+  setVoxEnabled(on) {
+    const want = !!on;
+    if (want === this.voxEnabled) return;
+    this.voxEnabled = want;
+    if (want) this._startVox();
+    else this._stopVox();
+  }
+
+  // Start the VOX detection loop. It reads level from the INDEPENDENT monitor capture stream (see
+  // monitorRawLevel / startMicMonitor), NOT the LiveKit publish track — the publish track is muted
+  // between transmissions, and a muted LiveKit track disables its MediaStreamTrack, so an analyser on
+  // it reads silence and VOX could never open (the "lobby mic never lights green" bug). The monitor
+  // stream is always live, so VOX detects speech reliably; we still drive the LiveKit track's
+  // mute/unmute from the VOX decision so transmission follows detection.
+  _startVox() {
+    try {
+      // Ensure the independent capture monitor is running so monitorRawLevel() has live samples.
+      // Safe to call repeatedly (no-ops if already running).
+      this.startMicMonitor();
+      this._voxActive = false;
+      this._voxAboveSince = 0;
+      this._voxBelowSince = performance.now();
+      const generation = this._generation, voxGeneration = ++this._voxGeneration;
+      // Start muted; the loop opens the mic once the pilot actually speaks.
+      if (this.micTrack) { try { Promise.resolve(this.micTrack.mute()).catch(() => {}); } catch {} }
+      this.micEnabled = false;
+      const loop = () => {
+        if (generation !== this._generation || voxGeneration !== this._voxGeneration || !this.voxEnabled) return;
+        this._voxTick();
+        if (generation !== this._generation || voxGeneration !== this._voxGeneration || !this.voxEnabled) return;
+        this._voxRAF = requestAnimationFrame(loop);
+      };
+      this._voxRAF = requestAnimationFrame(loop);
+    } catch (err) {
+      console.info('[voice] VOX unavailable — falling back to push-to-talk.', err && err.message);
+      this._stopVox();
+    }
+  }
+
+  // One VOX sample: read the live monitor level, apply open/close thresholds with hangover, and flip
+  // the LiveKit mic + fire the speaking-edge callback so presence + HUD track the live transmission.
+  _voxTick() {
+    // Level from the always-live monitor stream (0 until the monitor's getUserMedia resolves).
+    const level = this.monitorRawLevel();
+    const now = performance.now();
+    // Hysteresis: open louder than we close so it doesn't chatter. Thresholds come from the pilot's
+    // Mic Sensitivity setting (see settings.micTalkThreshold), so the pause-menu slider tunes VOX to
+    // the individual mic/room instead of a fixed guess. OPEN trips transmission; CLOSE (a bit lower)
+    // releases it after the hangover below.
+    const OPEN = micTalkThreshold(), CLOSE = micReleaseThreshold();
+    const OPEN_MS = 40, HANG_MS = 320;  // brief attack; longer release so words aren't clipped
+    if (level >= OPEN) { this._voxBelowSince = 0; if (!this._voxAboveSince) this._voxAboveSince = now; }
+    else if (level < CLOSE) { this._voxAboveSince = 0; if (!this._voxBelowSince) this._voxBelowSince = now; }
+    let next = this._voxActive;
+    if (!this._voxActive && this._voxAboveSince && now - this._voxAboveSince >= OPEN_MS) next = true;
+    else if (this._voxActive && this._voxBelowSince && now - this._voxBelowSince >= HANG_MS) next = false;
+    if (next !== this._voxActive) {
+      this._voxActive = next;
+      this.setMicEnabled(next);
+      if (this.onVoxActive) { try { this.onVoxActive(next); } catch {} }
+    }
+  }
+
+  // Stop the VOX detection loop and ensure the mic ends muted. Does NOT stop the shared capture
+  // monitor — the self-test meter (and a later VOX re-enable) still uses it.
+  _stopVox() {
+    ++this._voxGeneration;
+    if (this._voxRAF) { cancelAnimationFrame(this._voxRAF); this._voxRAF = null; }
+    if (this._voxActive) { this._voxActive = false; if (this.onVoxActive) { try { this.onVoxActive(false); } catch {} } }
+    if (this.micTrack) { try { Promise.resolve(this.micTrack.mute()).catch(() => {}); } catch {} }
+    this.micEnabled = false;
+  }
+
+  // Leave the room and clean up every attached remote audio element + the local mic track.
+  async disconnect() {
+    ++this._generation;
+    this._connecting = false;
+    this.stopMicMonitor();
+    this.setMicEnabled(false);
+    const room = this.room;
+    this._teardownLocal();
+    this.status = 'off';   // clean leave: back to the no-attempt state (failure paths keep 'unavailable')
+    this.reason = '';
+    if (room) { try { await room.disconnect(); } catch {} }
+  }
+
+  // Local cleanup shared by disconnect() and the Disconnected event. Detaches remote audio,
+  // stops the mic track, and clears state so a later connect() starts fresh.
+  _teardownLocal() {
+    this._stopVox();
+    // NOTE: do NOT stop the mic self-test monitor here. The monitor is an INDEPENDENT local capture
+    // stream that powers the lobby mic-green light and the self-test meter, and it must survive the
+    // LiveKit room lifecycle (a no-token/offline build never connects LiveKit at all, yet the pilot
+    // still needs to see their own mic light up). The app stops it explicitly via stopMicMonitor()
+    // when it actually leaves the lobby/arena. Tearing it down here was killing the light the moment
+    // the LiveKit room dropped or failed to come up.
+    this.voxEnabled = false;
+    for (const el of this._audioEls.values()) { try { el.pause(); el.remove(); } catch {} }
+    this._audioEls.clear();
+    if (this.micTrack) { try { this.micTrack.stop(); } catch {} this.micTrack = null; }
+    this.room = null;
+    this.connected = false;
+    this.micEnabled = false;
+  }
+}
