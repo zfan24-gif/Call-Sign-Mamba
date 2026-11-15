@@ -40,6 +40,13 @@ The arena supports FFA, Squadron Death Match, Capture the Cargo, Capture the Dat
 
 Run `npm test` for game-rule regressions. The production `/health` response carries `X-CSM-Revision` when Railway supplies `RAILWAY_GIT_COMMIT_SHA`. Compare that value with the deployed branch head to verify the running binary.
 
+**Voice authorization.** Credentials are issued only to an active joined arena connection,
+using server-owned room and pilot identity. `/voice-token` now returns HTTP 410.
+Tokens last 60 seconds, permit microphone publication and subscription, and deny data
+publication. Reconnection revokes the old membership and waits for prior SFU cleanup.
+See [`docs/VOICE.md`](./docs/VOICE.md) for limits, tests, configuration and the required
+coordinated Rosebud/Railway rollout and rollback.
+
 ## Run it locally
 
 Requires Node.js 18+.

@@ -18,5 +18,8 @@
     "@colyseus/ws-transport": "^0.15.0",
     "colyseus": "^0.15.17",
     "livekit-server-sdk": "^2.7.2"
+  },
+  "devDependencies": {
+    "colyseus.js": "^0.15.28"
   }
 }
