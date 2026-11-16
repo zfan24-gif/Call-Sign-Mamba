@@ -54,7 +54,12 @@ async function serverFixture(t) {
     }
     const f = { first, room, flush, pick, controlled,
       get now() { return now; },
-      tick(seconds = DT) { assert.ok(controlled); now += seconds; room.tick(); },
+      tick(seconds = DT) { f.tickTo(now + seconds); },
+      tickTo(timestamp) {
+        assert.ok(controlled);
+        assert.ok(Number.isFinite(timestamp) && timestamp >= now, 'controlled clock only advances to finite, nondecreasing timestamps');
+        now = timestamp; room.tick();
+      },
       async join(name = 'SECOND') { return track(await api.joinById(first.roomId, { name, ship: 'lightning' })); },
       async reconnect(c) {
         const token = c.reconnectionToken, sid = c.sessionId;
@@ -70,7 +75,7 @@ async function serverFixture(t) {
         assert.equal(room.state.matchState, 'live');
         assert.ok(room.state.selectionTimeLeft > 9.9 && room.state.selectionTimeLeft <= 10);
       },
-      finishSelection() { f.tick(10.001); assert.equal(room.state.selectionTimeLeft, 0); },
+      finishSelection() { f.tickTo(room._selectionEndsAt); assert.equal(room.state.selectionTimeLeft, 0); },
     };
     await flush(first, [['config', { mode, demoBotsEnabled: false }]]);
     assert.equal(room.state.mode, mode); assert.equal(room.state.demoBotsEnabled, false);
@@ -450,8 +455,12 @@ test('actual websocket FFA permits every hull but selection deadlines survive re
   assert.equal(reply.accepted, true); assert.equal(reply.round, round); closeTo(reply.remaining, 8, .01, 'reconnect keeps original deadline');
   const late = await f.join('LATE');
   reply = await f.pick(late, 'fighter'); assert.equal(reply.accepted, true); closeTo(reply.remaining, 8, .01, 'late join shares deadline');
-  f.tick(7.99); reply = await f.pick(next, 'bomber'); assert.equal(reply.accepted, true); assert.ok(reply.remaining > 0 && reply.remaining < .02);
-  f.tick(.01); reply = await f.pick(next, 'lightning');
+  const deadline = f.room._selectionEndsAt;
+  f.tickTo(deadline - .01); reply = await f.pick(next, 'bomber'); assert.equal(reply.accepted, true); assert.ok(reply.remaining > 0 && reply.remaining < .02);
+  // Use the authoritative timestamp exactly: summing 2+7.99+.01 can land one
+  // floating-point unit before the cutoff and incorrectly test an eligible pick.
+  f.tickTo(deadline); assert.equal(f.now, deadline);
+  reply = await f.pick(next, 'lightning');
   assert.equal(reply.accepted, false); assert.equal(reply.locked, true); assert.equal(reply.remaining, 0); assert.equal(shipOf(f, next).ship, 'bomber');
   const post = await f.join('AFTER'); assert.equal(shipOf(f, post).loadoutLocked, true);
   const defaultHull = shipOf(f, post).ship;
