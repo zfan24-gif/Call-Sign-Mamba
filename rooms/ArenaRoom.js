@@ -15,6 +15,7 @@ import { VoiceAccess } from '../voice/VoiceAccess.js';
 import { ArenaState, Ship, Bolt, Missile, Cargo, ARENA_CHAFF_CAPACITY } from './schema.js';
 import { stepShip, forwardFromQuat, yawQuatToward, FLIGHT } from '../shared/flightModel.js';
 import { sanitizeShip, statsFor } from './shipStats.js';
+import { MovementBudget, MAX_INPUT_STEP, MAX_MOVEMENT_CREDIT } from '../shared/inputClock.js';
 // ---- DEMO-ONLY (REMOVE BEFORE SHIP) ----------------------------------------------------------
 // AI squadron filler so a CTC lobby can be recorded with a lively 4v5 match WITHOUT 9 human pilots.
 // See DemoBots.js. Everything is gated behind DEMO_BOTS below and namespaced under `bot:` session
@@ -31,7 +32,7 @@ const TICK_MS = 1000 / TICK_HZ;
 const FIXED_DT = 1 / TICK_HZ;       // seconds per tick fed to the shared integrator
 const MAX_PER_TEAM = 12;            // 12v12 -> 24 players max
 const MAX_CLIENTS = MAX_PER_TEAM * 2;
-const INPUT_QUEUE_CAP = 8;          // per-player: cap buffered inputs so a flooding client can't grow memory
+const INPUT_QUEUE_CAP = 128;          // per-player: cap buffered inputs so a flooding client can't grow memory
 
 // --- Combat tuning (all authoritative; clients only render the results) -----------------------
              // units/sec — fast tracer
@@ -259,9 +260,11 @@ export class ArenaRoom extends Room {
     // Clients send an "input" message each of their frames: a normalized intent + a monotonically
     // increasing seq. We buffer it; the fixed tick consumes it. We validate/clamp on apply.
     this.onMessage('input', (client, msg) => {
-      const s = this.sim.get(client.sessionId);
-      if (!s || !msg || this.state.matchState === 'ended') return;
-      // Guard against floods: keep only the most recent inputs.
+      const s = this.sim.get(client.sessionId), ship = this.state.ships.get(client.sessionId);
+      if (!s || !ship?.alive || !ship.connected || this.state.matchState === 'ended'
+        || this.state.selectionTimeLeft > 0) return;
+      s.movement ??= new MovementBudget(this.movementNow());
+      if (!s.movement.accept(msg)) return;
       if (s.inputs.length >= INPUT_QUEUE_CAP) s.inputs.shift();
       s.inputs.push(sanitizeInput(msg));
     });
@@ -377,32 +380,12 @@ export class ArenaRoom extends Room {
       if (CAPTURE_TARGETS.includes(ct)) this.state.captureTarget = ct;
     });
 
-    // A client picks/changes their hull (during the ship-select window at match start). We validate
-    // the id, enforce that it belongs to the player's TEAM (blue = hero hulls, red = enemy hulls),
-    // update the replicated ship + its authoritative capacities/multipliers, and heal to the new
-    // hull's full capacity so the choice takes effect cleanly before the round.
-    this.onMessage('setShip', (client, msg) => {
-      const ship = this.state.ships.get(client.sessionId);
-      const s = this.sim.get(client.sessionId);
-      if (!ship || !s || !msg || this.state.matchState === 'ended') return;
-      // FFA: any of the 6 hulls is legal (team=-1 skips the filter). SDM: team-filtered.
-      const shipId = sanitizeShip(msg.ship, this.isFFA() ? -1 : ship.team);
-      if (shipId === ship.ship) return;
-      const st = statsFor(shipId);
-      ship.ship = shipId;
-      const maxHull = 100 * st.hull;
-      const maxShields = 100 * st.shield;
-      ship.hull = maxHull;
-      ship.shields = maxShields;
-      s.maxHull = maxHull;
-      s.maxShields = maxShields;
-      s.firepower = st.firepower;
-      s.speed = st.speed;
-      // Re-arm to the new hull's rack so the loadout matches the chosen ship before the round.
-      const maxMissiles = st.missiles || 4;
-      s.maxMissiles = maxMissiles;
-      ship.maxMissiles = maxMissiles;
-      ship.missiles = maxMissiles;
+    // Picks are provisional only during the server-owned selection phase. Once
+    // confirmed or timed out, a life/respawn/reconnect cannot reopen the loadout.
+    this.onMessage('setShip', (client, msg) => this.selectShip(client, msg));
+    this.onMessage('getShipSelection', client => {
+      this.updateShipSelection(this.movementNow());
+      this.sendShipSelection(client, true);
     });
 
     // READY-CHECK: any pilot toggles their own ready flag in the lobby. Replicated so every lobby
@@ -563,6 +546,8 @@ export class ArenaRoom extends Room {
     ship.name = name;
     ship.team = team;
     ship.ship = shipId;
+    this.updateShipSelection(this.movementNow());
+    ship.loadoutLocked = this.state.matchState !== 'lobby' && !(this.state.selectionTimeLeft > 0);
     // Client-reported career progression for the ranking/honor display (see client ranks.js). We
     // clamp the advancement score into the schema's uint32 range and coerce the Pioneer flag; these
     // are purely cosmetic (rank insignia + honor color), so a bad value can only mis-tint a badge.
@@ -612,6 +597,7 @@ export class ArenaRoom extends Room {
       quat: { x: ship.qx, y: ship.qy, z: ship.qz, w: ship.qw },
       inputs: [],
       lastSeq: 0,
+      movement: new MovementBudget(this.movementNow()),
       // Combat scratch (server-only, never replicated):
       fireCd: 0,        // seconds remaining until this player can fire again
       missileCd: 0,     // seconds remaining until this player can launch another missile
@@ -657,6 +643,7 @@ export class ArenaRoom extends Room {
       try {
         const restored = await this.allowReconnection(client, RECONNECT_GRACE_SECONDS);
         ship.connected = true;
+        sim.movement?.reset(this.movementNow());
         this.voiceAccess?.join(restored);
         this.observeClose(restored);
         console.info('[arena] seat restored', { room: this.roomId, pilot: sid });
@@ -715,8 +702,16 @@ export class ArenaRoom extends Room {
 
   // One authoritative simulation step: move ships, regen shields, advance bolts + hit-detect, and
   // process death/respawn. Everything here is server truth; clients only render the replicated state.
+  movementNow() { return performance.now() / 1000; }
+
   tick() {
     if (this.state.matchState === 'ended') return;
+    const movementNow = this.movementNow();
+    this.updateShipSelection(movementNow);
+    if (this.state.selectionTimeLeft > 0) {
+      for (const s of this.sim.values()) { s.inputs.length = 0; s.movement?.reset(movementNow); }
+      return;
+    }
     this._now += FIXED_DT;
 
     // --- 0) Round clock (Squadron Death Match) ------------------------------------------------
@@ -758,33 +753,33 @@ export class ArenaRoom extends Room {
         continue;   // no input/movement/regen while dead
       }
 
-      // Consume the inputs buffered since the last tick, integrating EACH at the EXACT frame dt the
-      // client stamped on it. This is the heart of client/server agreement: the client predicts every
-      // frame locally at its real dt, so the server must reintegrate those same frames at those same
-      // dts. drag, the top-speed clamp and the boundary pull are all NON-LINEAR in dt (two half-steps
-      // != one full step), so ANY time-rescaling here permanently diverges from the client's prediction
-      // — the "rubber-band while moving" that reconciliation could never win.
-      //
-      // FAITHFUL REPLAY: integrate EVERY buffered frame in order at its OWN stamped dt — no rescaling,
-      // no time-compression, no dropping inside the tick. Because the client predicted each of these
-      // frames locally at exactly these dts, reintegrating them identically leaves prediction and
-      // authoritative truth in near-perfect agreement, so reconciliation has essentially nothing to
-      // correct (this is what removes the "rubber-band while moving" for good). Runaway motion is
-      // already bounded upstream: the input queue is capped at INPUT_QUEUE_CAP and DROPS THE OLDEST on
-      // overflow at arrival time (see onMessage 'input'), so a post-hitch backlog can never exceed a
-      // few frames of real dt here, and any frame that WAS dropped was discarded before it received an
-      // ack — the client keeps replaying it, so no unacked-yet-applied gap can open.
-      const frames = s.inputs.length;
-      if (frames) {
-        for (let i = 0; i < frames; i++) {
-          stepShip(s, s.inputs[i], s.inputs[i].dt || FIXED_DT, s.speed || 1);
+      // Client dt controls the integration subdivision, never the amount of time
+      // available. Both received frames and held-input fallback pay this allowance.
+      s.movement ??= new MovementBudget(movementNow);
+      s.movement.refill(movementNow);
+      // Retire old controls after a delivery stall. Otherwise incoming real-time frames
+      // replenish the backlog as fast as we consume it, leaving permanent control lag.
+      // Retirement acknowledges discarded prediction without advancing simulation time.
+      let queuedTime = s.inputs.reduce((total, frame) => total + frame.dt, 0);
+      while (s.inputs.length > 1 && queuedTime > MAX_MOVEMENT_CREDIT + 1e-9) {
+        const retired = s.inputs.shift();
+        queuedTime -= retired.dt;
+        s.lastSeq = retired.seq >>> 0;
+      }
+      if (s.inputs.length) {
+        while (s.inputs.length) {
+          const input = s.inputs[0];
+          const frameDt = Number.isFinite(input.dt) && input.dt > 0 ? Math.min(MAX_INPUT_STEP, input.dt) : 0;
+          if (!frameDt) { s.inputs.shift(); continue; }
+          if (!s.movement.spend(frameDt)) break;
+          s.inputs.shift();
+          stepShip(s, input, frameDt, s.speed || 1);
+          s.lastInput = input;
+          s.lastSeq = input.seq >>> 0;
         }
-        s.lastInput = s.inputs[frames - 1];
-        s.lastSeq = s.lastInput.seq >>> 0;   // ack the newest applied input so the client stops replaying them
-        s.inputs.length = 0;
       } else {
-        // No new input this tick: coast on the last held input so a brief packet gap doesn't stutter.
-        stepShip(s, s.lastInput || IDLE_INPUT, FIXED_DT, s.speed || 1);
+        const fallbackDt = Math.min(FIXED_DT, s.movement.credit);
+        if (s.movement.spend(fallbackDt)) stepShip(s, s.lastInput || IDLE_INPUT, fallbackDt, s.speed || 1);
       }
       const input = s.lastInput || IDLE_INPUT;
 
@@ -824,7 +819,9 @@ export class ArenaRoom extends Room {
       ship.px = s.pos.x; ship.py = s.pos.y; ship.pz = s.pos.z;
       ship.vx = s.vel.x; ship.vy = s.vel.y; ship.vz = s.vel.z;
       ship.qx = s.quat.x; ship.qy = s.quat.y; ship.qz = s.quat.z; ship.qw = s.quat.w;
-      ship.boost = !!input.boost;
+      ship.engineHeat = s.heat?.v || 0;
+      ship.engineOverheated = !!s.heat?.over;
+      ship.boost = !!input.boost && !ship.engineOverheated;
       // Authoritative "engines burning" flag for remote engine-trail length. True only while the
       // pilot is actively thrusting forward or reversing this tick; a ship coasting on momentum
       // (no throttle) reports false so observers render just a faint idle plume instead of a
@@ -981,7 +978,7 @@ export class ArenaRoom extends Room {
 
   // Attempt to fire from `sessionId`: authoritative rate-limit + spawn a bolt down the nose.
   tryFire(sessionId) {
-    if (this.state.matchState === 'ended') return;
+    if (this.state.matchState === 'ended' || this.state.selectionTimeLeft > 0) return;
     const ship = this.state.ships.get(sessionId);
     const s = this.sim.get(sessionId);
     if (!ship || !s || !ship.alive) return;
@@ -1010,7 +1007,7 @@ export class ArenaRoom extends Room {
   // target is a live hostile, rate-limits, and spawns a homing missile from the shooter's nose. A
   // missing/invalid target degrades to a dumbfire missile that flies straight (target = '').
   tryFireMissile(sessionId, targetId) {
-    if (this.state.matchState === 'ended') return;
+    if (this.state.matchState === 'ended' || this.state.selectionTimeLeft > 0) return;
     const ship = this.state.ships.get(sessionId);
     const s = this.sim.get(sessionId);
     if (!ship || !s || !ship.alive) return;
@@ -1075,7 +1072,7 @@ export class ArenaRoom extends Room {
 
   deployChaff(sid) {
     const ship = this.state.ships.get(sid);
-    if (this.state.matchState !== 'live' || !ship?.alive || !ship.connected || ship.chaff <= 0) return;
+    if (this.state.matchState !== 'live' || this.state.selectionTimeLeft > 0 || !ship?.alive || !ship.connected || ship.chaff <= 0) return;
     const sim = this.sim.get(sid);
     if (!sim) return;
     const nose = forwardFromQuat(sim.quat);
@@ -1773,6 +1770,8 @@ export class ArenaRoom extends Room {
     ship.missiles = s.maxMissiles || ship.maxMissiles || 4;
     ship.chaff = ARENA_CHAFF_CAPACITY;
     s.killStreak = 0;
+    s.heat = { v: 0, over: false };
+    ship.engineHeat = 0; ship.engineOverheated = false;
     ship.alive = true;
     ship.respawnIn = 0;          // alive again — clear the replicated countdown
     ship.oobTimer = 0;           // fresh spawn is well in-bounds; never inherit a stale OOB countdown
@@ -1780,6 +1779,7 @@ export class ArenaRoom extends Room {
     s.lastHitAt = this._now;
     s.inputs.length = 0;
     s.lastInput = IDLE_INPUT;
+    s.movement?.reset(this.movementNow());
     // Clear the lag-comp history so a shot arriving right after respawn can't rewind into this pilot's
     // PREVIOUS life's death position (which is nowhere near the fresh spawn).
     s.history.length = 0;
@@ -1850,9 +1850,57 @@ export class ArenaRoom extends Room {
     return any;
   }
 
+  sendShipSelection(client, accepted) {
+    const ship = this.state.ships.get(client.sessionId);
+    if (!ship) return;
+    client.send('shipSelection', { ship: ship.ship, accepted, locked: ship.loadoutLocked,
+      remaining: this.state.selectionTimeLeft || 0, round: this.state.roundId });
+  }
+
+  updateShipSelection(now) {
+    if (!(this.state.selectionTimeLeft > 0)) return;
+    this.state.selectionTimeLeft = Math.max(0, this._selectionEndsAt - now);
+    if (this.state.selectionTimeLeft > 0) return;
+    for (const [sid, ship] of this.state.ships) {
+      ship.loadoutLocked = true;
+      const s = this.sim.get(sid);
+      if (s) { s.inputs.length = 0; s.lastInput = IDLE_INPUT; s.movement?.reset(now); }
+    }
+    for (const client of this.clients) this.sendShipSelection(client, true);
+  }
+
+  selectShip(client, msg) {
+    const now = this.movementNow();
+    this.updateShipSelection(now);
+    const ship = this.state.ships.get(client.sessionId), s = this.sim.get(client.sessionId);
+    if (!ship || !s || !ship.connected) return;
+    const id = typeof msg?.ship === 'string' ? msg.ship.toLowerCase() : '';
+    const eligible = id && sanitizeShip(id, this.isFFA() ? -1 : ship.team) === id;
+    const picking = this.state.matchState === 'lobby'
+      || (this.state.matchState === 'live' && this.state.selectionTimeLeft > 0 && !ship.loadoutLocked);
+    if (!eligible || !picking || (msg.round !== undefined && msg.round !== this.state.roundId)) {
+      this.sendShipSelection(client, false); return;
+    }
+    if (id !== ship.ship) {
+      const st = statsFor(id);
+      ship.ship = id;
+      ship.hull = s.maxHull = 100 * st.hull;
+      ship.shields = s.maxShields = 100 * st.shield;
+      s.firepower = st.firepower; s.speed = st.speed;
+      ship.missiles = ship.maxMissiles = s.maxMissiles = st.missiles || 4;
+    }
+    if (this.state.matchState === 'live' && msg.confirm === true) ship.loadoutLocked = true;
+    this.sendShipSelection(client, true);
+  }
+
   startMatch() {
     this._chaffClouds.length = 0;
     this.state.matchState = 'live';
+    this.state.roundId = (this.state.roundId + 1) >>> 0;
+    this._selectionEndsAt = this.movementNow() + 10;
+    this.state.selectionTimeLeft = 10;
+    this.state.bolts.clear();
+    this.state.missiles.clear();
     this.state.timeLeft = this.state.roundDuration;
     this.state.blueKills = 0;
     this.state.redKills = 0;
@@ -1869,6 +1917,7 @@ export class ArenaRoom extends Room {
       ship.kills = 0;
       ship.deaths = 0;
       ship.ready = false;
+      ship.loadoutLocked = false;
       ship.carrying = false;   // no one starts a round holding cargo
       const s = this.sim.get(sid);
       if (s) this.respawnShip(sid, ship, s);
@@ -1883,6 +1932,7 @@ export class ArenaRoom extends Room {
     if (this.isCSA()) this.capitalAssault.setup();
     else this.capitalAssault.clear();
     this.broadcast('matchStart', {
+      selectionTimeLeft: 10, round: this.state.roundId,
       roundDuration: this.state.roundDuration,
       mode: this.state.mode,
       captureTarget: this.state.captureTarget,
@@ -1997,10 +2047,8 @@ const IDLE_INPUT = { seq: 0, steerX: 0, steerY: 0, roll: 0, thrust: false, rever
 function sanitizeInput(m) {
   return {
     seq: (m.seq >>> 0) || 0,
-    // Frame timestep the client integrated this input with. Clamp to a sane range so a bogus/huge
-    // value can't fling a ship; 0 means "unknown" (older clients) and the tick falls back to its
-    // own even sub-division of the fixed step. Cap at ~50ms (a 20fps frame) to bound catch-up.
-    dt: clampNum(m.dt, 0, 0.05),
+    // Strict positive/finite validation occurs before buffering. Never reinterpret zero as a tick.
+    dt: Math.min(m.dt, MAX_INPUT_STEP),
     steerX: clampNum(m.steerX, -1.4, 1.4),
     steerY: clampNum(m.steerY, -1.4, 1.4),
     roll: clampNum(m.roll, -1, 1),
