@@ -10,7 +10,7 @@ import { Schema, MapSchema, defineTypes } from '@colyseus/schema';
 export const ARENA_CHAFF_CAPACITY = 6;
 // (Cargo is declared below and referenced in ArenaState's cargo map.)
 
-// One networked ship. `lastSeq` is the input frame number the server has applied for this player;
+// One networked ship. `lastSeq` is the input frame number the server has applied or retired for this player;
 // the owning client uses it to discard already-acknowledged inputs and re-simulate the rest on top
 // of the authoritative snapshot (client-side prediction reconciliation).
 export class Ship extends Schema {
@@ -62,6 +62,9 @@ export class Ship extends Schema {
     // the room is ready. Replicated so every lobby shows each pilot's ready pip live. Reset to false
     // on join and after a match ends (back to the lobby), so a fresh ready-check runs each round.
     this.ready = false;
+    this.loadoutLocked = false;
+    this.engineHeat = 0;
+    this.engineOverheated = false;
     // --- Capture the Cargo ---
     // True while THIS pilot is carrying an enemy cargo pod (the "flag"). Replicated so every client
     // can render the carried pod slung under the hull AND so the HUD emphasizes a carrier's targeting
@@ -100,6 +103,9 @@ defineTypes(Ship, {
   rankScore: 'uint32',
   pioneer: 'boolean',
   ready: 'boolean',
+  loadoutLocked: 'boolean',
+  engineHeat: 'float32',
+  engineOverheated: 'boolean',
   carrying: 'boolean',
   oobTimer: 'float32',
   connected: 'boolean',
@@ -255,6 +261,8 @@ export class ArenaState extends Schema {
     this.redCount = 0;
     // --- Match / game-mode state (host-configured in the lobby, server-authoritative) ---
     this.mode = 'sdm';           // game mode id; 'sdm' = Squadron Death Match (only mode for now)
+    this.roundId = 0;
+    this.selectionTimeLeft = 0;
     this.matchState = 'lobby';   // 'lobby' (pre-round, host configures) | 'live' (clock running) | 'ended'
     this.roundDuration = 600;    // configured round length in seconds (default 10 min). Host-settable in lobby.
     this.timeLeft = 600;         // seconds remaining in the live round; counts down to 0 and stops (never negative)
@@ -289,6 +297,8 @@ defineTypes(ArenaState, {
   redCount: 'uint8',
   mode: 'string',
   matchState: 'string',
+  roundId: 'uint32',
+  selectionTimeLeft: 'float32',
   roundDuration: 'float32',
   timeLeft: 'float32',
   blueKills: 'uint16',

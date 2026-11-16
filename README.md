@@ -111,3 +111,42 @@ concurrent arenas; beyond that you'll want multiple instances and Colyseus' buil
 `shared/flightModel.js` (server) and `../netFlightModel.js` (client) contain the **same** integrator.
 If you tune flight on one side, tune the other identically — if they diverge, the local ship
 rubber-bands on each server correction and remote ships jitter.
+
+## Movement and round loadouts (November 2026)
+
+Inputs must carry a strictly newer uint32 `seq` (wrap supported) and a finite,
+positive numeric `dt`. Steps are capped at 50 ms. A monotonic server clock earns
+movement time with at most 100 ms of accumulated credit; received input and
+held-control coasting spend the same credit. At most 128 frames are buffered.
+After stalls, frames beyond the newest 100 ms are retired without movement.
+`lastSeq` acknowledges both applied and retired input, so the client discards
+stale prediction. `engineHeat` and `engineOverheated` accompany the authoritative
+pose; client reconciliation rewinds heat and replays unacknowledged input.
+
+Each `matchStart` begins a server-owned ten-second selection period. The round
+clock, movement and weapons remain paused. `selectionTimeLeft` and `roundId`
+are replicated, and each ship exposes `loadoutLocked`. The client sends each
+highlighted legal choice during the window and may confirm it early:
+
+```js
+room.send('setShip', { ship: 'lightning', confirm: true, round: currentRound });
+```
+
+The server replies with `shipSelection` containing `ship`, `accepted`, `locked`,
+`remaining` and `round`. Register the handler before sending `getShipSelection`
+to recover current selection state. Launch only after authoritative remaining
+is zero and the loadout is locked. At expiry the last accepted ship is final;
+repeated live changes cannot refill health or ammunition. Team rosters and all
+six FFA hulls are enforced. Reconnection preserves the existing deadline and
+loadout, respawn preserves the selected hull, and the next round opens a fresh
+window. The existing joined-connection voice authorization is unchanged.
+
+Deploy this server together with the updated Rosebud picker and reconciliation
+client. Prepare and verify both before merging main, wait for the intended
+Railway revision and health check, publish the prepared client, and reload
+already-open game tabs. For rollback restore both client and server. Use only
+owned isolated arenas for production smoke checks. `npm test` includes actual
+local Colyseus websocket coverage, a real-time ten-second selection smoke, and
+controlled-clock tests for 10–360 FPS, jitter, stalls, retirement, reconnect,
+selection restrictions, heat, and sequence wrap. These tests do not establish
+rendered gameplay smoothness or real WAN/microphone behavior.

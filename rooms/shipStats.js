@@ -37,7 +37,7 @@ export function sanitizeShip(id, team) {
     const roster = rosterFor(team);
     return roster.includes(key) ? key : roster[0];
   }
-  return SHIP_STATS[key] ? key : DEFAULT_SHIP;
+  return Object.hasOwn(SHIP_STATS, key) ? key : DEFAULT_SHIP;
 }
 
 // The balance multipliers for a (validated) ship id.
