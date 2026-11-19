@@ -1,3 +1,4 @@
+import {nextICXMuzzle} from './icxMuzzles.js';
 import { BOLT_SPEED, BOLT_LIFETIME, FIRE_COOLDOWN, MISSILE_LOCK_RANGE } from '../shared/combatHardware.js';
 import { segmentSphereTime } from '../shared/capitalFireControl.js';
 // ---- ArenaRoom: the authoritative 12v12 match room -------------------------------------------
@@ -987,18 +988,19 @@ export class ArenaRoom extends Room {
     s.fireCd = FIRE_COOLDOWN;
 
     const fwd = forwardFromQuat(s.quat);      // unit nose vector
+    const muzzle = nextICXMuzzle(ship.ship, s);
     const bolt = new Bolt();
     bolt.owner = sessionId;
     bolt.team = ship.team;
     // Spawn just ahead of the muzzle, inheriting the ship's velocity plus bolt speed along the nose.
-    bolt.px = s.pos.x + fwd.x * BOLT_MUZZLE;
-    bolt.py = s.pos.y + fwd.y * BOLT_MUZZLE;
-    bolt.pz = s.pos.z + fwd.z * BOLT_MUZZLE;
+    bolt.px = s.pos.x + (muzzle ? muzzle.x : fwd.x * BOLT_MUZZLE);
+    bolt.py = s.pos.y + (muzzle ? muzzle.y : fwd.y * BOLT_MUZZLE);
+    bolt.pz = s.pos.z + (muzzle ? muzzle.z : fwd.z * BOLT_MUZZLE);
     bolt.vx = s.vel.x + fwd.x * BOLT_SPEED;
     bolt.vy = s.vel.y + fwd.y * BOLT_SPEED;
     bolt.vz = s.vel.z + fwd.z * BOLT_SPEED;
 
-    const id = 'b' + (++this._boltSeq);
+    const id = 'b' + (++this._boltSeq) + (muzzle ? '.m' + muzzle.slot : '');
     bolt._ttl = BOLT_LIFETIME;                // server-only lifetime (not replicated)
     this.state.bolts.set(id, bolt);
   }
@@ -1853,7 +1855,7 @@ export class ArenaRoom extends Room {
   sendShipSelection(client, accepted) {
     const ship = this.state.ships.get(client.sessionId);
     if (!ship) return;
-    client.send('shipSelection', { ship: ship.ship, accepted, locked: ship.loadoutLocked,
+    client.send('shipSelection', { ship: ship.ship, icxMuzzleCycle:true, nextICXPort:this.sim.get(client.sessionId)?.nextICXPort || 0, accepted, locked: ship.loadoutLocked,
       remaining: this.state.selectionTimeLeft || 0, round: this.state.roundId });
   }
 
