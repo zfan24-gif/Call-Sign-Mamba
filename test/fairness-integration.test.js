@@ -5,6 +5,7 @@ import { Client } from 'colyseus.js';
 import { matchMaker } from '@colyseus/core';
 import { createArenaServer } from '../index.js';
 import { FLIGHT, HEAT, stepShip } from '../shared/flightModel.js';
+import { BOLT_SPEED, FIRE_COOLDOWN } from '../shared/combatHardware.js';
 import { statsFor } from '../rooms/shipStats.js';
 
 // These are actual local Colyseus websocket rooms. Only their monotonic clock and
@@ -409,7 +410,7 @@ test('actual websocket ship-selection status queries are accepted without changi
     const reply = f.first.messages.slice(beforeMessages).filter(m => m.type === 'shipSelection').at(-1)?.data;
     assert.ok(reply, 'status query returns a shipSelection reply');
     assert.equal(reply.accepted, true, 'a status query is not a rejected ship choice');
-    assert.deepEqual(reply, { ship: before.ship, accepted: true, locked: before.locked,
+    assert.deepEqual(reply, { ship: before.ship, icxMuzzleCycle: true, nextICXPort: 0, accepted: true, locked: before.locked,
       remaining: before.remaining, round: before.round });
     assert.deepEqual({ ship: ship.ship, locked: ship.loadoutLocked, deadline: f.room._selectionEndsAt,
       remaining: f.room.state.selectionTimeLeft, round: f.room.state.roundId,
@@ -426,6 +427,60 @@ test('actual websocket ship-selection status queries are accepted without changi
   await queryUnchanged();
   f.tick(8.001); assert.equal(f.room.state.selectionTimeLeft, 0);
   await queryUnchanged();
+});
+
+test('ICX lasers replicate each rotated hull socket to both pilots and FSA retains its centerline origin', async t => {
+  // Local positions measured on the three assembled Rosebud models, in muzzle order.
+  const hulls = [
+    ['interceptor', 'lightning', [[-.4439136, .1095215, -.4322863], [-.5132751, .1410631, -.2867971], [.4439136, .108018, -.4162691], [.5132751, .167439, -.1893024]]],
+    ['fighter', 'fury', [[-.4479471, .0509409, -.2524448], [-.5319372, .0620163, -.2477816], [.4479471, .0509409, -.2524448], [.5319372, .0620163, -.2477816]]],
+    ['bomber', 'concept', [[-1.0686595, 0, -3.088315], [-1.1723823, 0, -3.092714], [1.0686595, 0, -3.087392], [1.1723823, 0, -3.0928735]]],
+  ];
+  const service = await serverFixture(t);
+  for (const [icx, fsa, ports] of hulls) {
+    const f = await service.arena({ mode: 'ctc' });
+    const blue = f.first, red = await f.join('ICX');
+    await f.start([blue, red]);
+    assert.equal((await f.pick(blue, fsa, { confirm: true })).accepted, true);
+    const selected = await f.pick(red, icx, { confirm: true });
+    assert.equal(selected.accepted, true);
+    assert.equal(selected.icxMuzzleCycle, true);
+    assert.equal(selected.nextICXPort, 0);
+    f.finishSelection();
+
+    async function fireAndObserve(pilot, [x, y, z], slot) {
+      const sim = stateOf(f, pilot);
+      Object.assign(sim, {
+        pos: { x: 30, y: 220, z: 40 }, vel: { x: 8, y: 2, z: -4 },
+        quat: { x: 0, y: Math.SQRT1_2, z: 0, w: Math.SQRT1_2 },
+      });
+      const before = new Set(f.room.state.bolts.keys());
+      await f.flush(pilot, [['fire', null], ['fire', null]]);
+      const fresh = [...f.room.state.bolts.keys()].filter(id => !before.has(id));
+      assert.equal(fresh.length, 1, 'a second trigger during cooldown cannot emit or advance the port');
+      const [id] = fresh;
+      if (slot === null) assert.match(id, /^b\d+$/);
+      else assert.match(id, new RegExp(`^b\\d+\\.m${slot}$`));
+      await until(() => blue.state.bolts.has(id) && red.state.bolts.has(id), 'both pilots must receive the server bolt');
+      // A quarter-turn about +Y maps (x, y, z) to (z, y, -x), with the nose along -X.
+      const expected = { px: 30 + z, py: 220 + y, pz: 40 - x, vx: 8 - BOLT_SPEED, vy: 2, vz: -4 };
+      for (const client of [blue, red]) {
+        const bolt = client.state.bolts.get(id);
+        assert.equal(bolt.owner, pilot.sessionId);
+        for (const [field, value] of Object.entries(expected)) closeTo(bolt[field], value, .0001, field);
+      }
+    }
+
+    for (let shot = 0; shot <= ports.length; shot++) {
+      const slot = shot % ports.length;
+      await fireAndObserve(red, ports[slot], slot);
+      await f.flush(red, [['getShipSelection', undefined]]);
+      const reply = red.messages.filter(m => m.type === 'shipSelection').at(-1).data;
+      assert.equal(reply.nextICXPort, (slot + 1) % ports.length);
+      for (let i = 0; i < Math.ceil(FIRE_COOLDOWN / DT); i++) f.tick();
+    }
+    await fireAndObserve(blue, [0, 0, -6], null);
+  }
 });
 
 test('actual websocket FFA rejects inherited-property and unknown hull identifiers', async t => {
