@@ -922,9 +922,9 @@ export class ArenaRoom extends Room {
 
         // Symmetric collision damage: each ship rams the other and is credited as the attacker on the
         // opposing ship. damageShip handles shields-first, hit broadcast, and kill credit/death.
-        this.damageShip(a.sid, a.ship, SHIP_COLLIDE_DAMAGE, b.sid);
+        this.damageShip(a.sid, a.ship, SHIP_COLLIDE_DAMAGE, b.sid, false, 'collision');
         // b may have died from the ram above; only damage it if still alive so we don't double-kill.
-        if (b.ship.alive) this.damageShip(b.sid, b.ship, SHIP_COLLIDE_DAMAGE, a.sid);
+        if (b.ship.alive) this.damageShip(b.sid, b.ship, SHIP_COLLIDE_DAMAGE, a.sid, false, 'collision');
       }
     }
     // Prune stale cooldown entries so the map doesn't grow unbounded over a long match.
@@ -1591,11 +1591,12 @@ export class ArenaRoom extends Room {
   // Apply damage to a ship: shields absorb first, then hull. Credits a kill on destruction.
   // Broadcasts a 'hit' event so BOTH the shooter (hit-marker "you connected") and the victim
   // (damage flash / "you're taking fire") get immediate feedback, independent of the kill event.
-  damageShip(sid, ship, dmg, attackerId, missile = false) {
+  damageShip(sid, ship, dmg, attackerId, missile = false, cause = 'weapon') {
     if (this.state.matchState === 'ended') return;
     const s = this.sim.get(sid);
     if (s) s.lastHitAt = this._now;
     const shieldHit = ship.shields > 0;   // did the shot land on shields (vs bare hull)?
+    const hullBefore = ship.hull, shieldsBefore = ship.shields;
     if (ship.shields > 0) {
       const absorbed = Math.min(ship.shields, dmg);
       ship.shields -= absorbed;
@@ -1607,6 +1608,10 @@ export class ArenaRoom extends Room {
     // and cheap). `lethal` lets the shooter skip the plain hit-marker when the kill event covers it.
     this.broadcast('hit', {
       attacker: attackerId, victim: sid, shield: shieldHit, lethal,
+      // Cosmetic feedback consumes authoritative loss, including shield overflow.
+      // Existing clients ignore these additive fields; combat and kill credit stay unchanged.
+      cause, shieldDamage: Math.max(0, shieldsBefore - ship.shields),
+      hullDamage: Math.max(0, Math.min(hullBefore, hullBefore - ship.hull)),
       ...(missile ? {missile:true} : {}),
       x: ship.px, y: ship.py, z: ship.pz,
     });

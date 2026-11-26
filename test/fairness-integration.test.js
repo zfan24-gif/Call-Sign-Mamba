@@ -98,6 +98,28 @@ function simulatedTurnSeconds(f, c = f.first) {
 }
 function closeTo(actual, expected, tolerance, label) { assert.ok(Math.abs(actual - expected) <= tolerance, `${label}: ${actual} versus ${expected} (tolerance ${tolerance})`); }
 
+test('actual websocket hit messages preserve collision cause and shield overflow hull loss', async t => {
+  const service=await serverFixture(t),f=await service.arena();
+  const second=await f.join('FEEDBACK');
+  await f.start([f.first,second]);f.finishSelection();
+  const a=shipOf(f),b=shipOf(f,second);
+  resetPose(f);resetPose(f,second);
+  stateOf(f,second).pos.x=4;b.px=4;
+  a.shields=100;b.shields=5;
+  f.room.resolveShipCollisions();
+  await until(()=>f.first.messages.filter(m=>m.type==='hit').length===2);
+  const hits=f.first.messages.filter(m=>m.type==='hit').map(m=>m.data);
+  assert(hits.every(h=>h.cause==='collision'&&!h.missile));
+  const shielded=hits.find(h=>h.victim===f.first.sessionId),overflow=hits.find(h=>h.victim===second.sessionId);
+  assert.deepEqual([shielded.shieldDamage,shielded.hullDamage],[22,0]);
+  assert.deepEqual([overflow.shieldDamage,overflow.hullDamage],[5,17]);
+  f.room.damageShip(f.first.sessionId,a,10,second.sessionId,true);
+  await until(()=>f.first.messages.filter(m=>m.type==='hit').length===3);
+  const weapon=f.first.messages.filter(m=>m.type==='hit').at(-1).data;
+  assert.equal(weapon.cause,'weapon');assert.equal(weapon.missile,true);
+  assert.equal(weapon.hullDamage,0);assert.equal(weapon.shieldDamage,10);
+});
+
 test('actual websocket input validation rejects stale/duplicate/malformed frames and accepts uint32 wrap', async t => {
   const service = await serverFixture(t), f = await service.arena(), defaultHull = shipOf(f).ship;
   await f.start(); f.finishSelection();
