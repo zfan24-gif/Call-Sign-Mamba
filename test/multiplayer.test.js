@@ -55,6 +55,42 @@ test('a bolt and missile report the real victim shield in separate damage events
   assert.equal(room.events.at(-1).data.shield,false);
 });
 
+test('hit feedback distinguishes shield-only, shield overflow, bare hull and lethal overkill', () => {
+  for (const [shields,hull,damage,shieldLoss,hullLoss,lethal] of [
+    [100,100,12,12,0,false], [12,100,12,12,0,false],
+    [5,100,12,5,7,false], [0,100,12,0,12,false], [0,5,120,0,5,true],
+  ]) {
+    const room=fixture('ffa');
+    ship(room,'attacker',0,-50);
+    const victim=ship(room,'defender',1);
+    Object.assign(victim,{shields,hull});
+    room.damageShip('defender',victim,damage,'attacker',true);
+    const hit=room.events.find(e=>e.type==='hit').data;
+    assert.equal(hit.cause,'weapon');
+    assert.equal(hit.missile,true);
+    assert.equal(hit.shield,shields>0);
+    assert.equal(hit.shieldDamage,shieldLoss);
+    assert.equal(hit.hullDamage,hullLoss);
+    assert.equal(hit.lethal,lethal);
+    assert.equal(victim.hull,Math.max(0,hull-hullLoss));
+  }
+});
+
+test('real ram resolution labels both hits and preserves symmetric damage and cooldown', () => {
+  const room=fixture('ffa');room._collideCd=new Map();
+  const a=ship(room,'shielded',0),b=ship(room,'unshielded',1,4);
+  a.shields=100;
+  room.resolveShipCollisions();
+  const hits=room.events.filter(e=>e.type==='hit').map(e=>e.data);
+  assert.equal(hits.length,2);
+  assert(hits.every(h=>h.cause==='collision'&&!h.missile&&!h.lethal));
+  const shielded=hits.find(h=>h.victim==='shielded'),bare=hits.find(h=>h.victim==='unshielded');
+  assert.deepEqual([shielded.shieldDamage,shielded.hullDamage,a.shields,a.hull],[22,0,78,100]);
+  assert.deepEqual([bare.shieldDamage,bare.hullDamage,b.shields,b.hull],[0,22,0,78]);
+  room.resolveShipCollisions();
+  assert.equal(room.events.filter(e=>e.type==='hit').length,2);
+});
+
 test('chaff spends one authoritative charge only in an active, connected life', () => {
   const room = fixture('ffa');
   const defender = ship(room, 'defender', 0);
